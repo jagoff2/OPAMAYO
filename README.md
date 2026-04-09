@@ -1,5 +1,5 @@
 #OpAmayo - an Alpamayo Openpilot Live Integration Proof And Runbook
-
+![OpAmayo]([image-url](https://github.com/jagoff2/OPAMAYO/blob/main/20260408_211309.jpg))
 ## Scope
 
 This document records:
