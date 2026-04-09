@@ -1,0 +1,137 @@
+{
+  "summary": {
+    "num_samples": 5,
+    "mean_full_seconds": 1.8043,
+    "mean_fast_seconds": 0.7254,
+    "mean_speedup_x": 2.4986,
+    "mean_full_ade_m": 2.8287,
+    "mean_fast_ade_m": 4.2029,
+    "mean_ade_delta_m": 1.3743,
+    "mean_fast_vs_full_ade_m": 3.0555,
+    "mean_fast_vs_full_fde_m": 9.5236,
+    "all_fast_finite": true,
+    "all_fast_within_bounds": true
+  },
+  "results": [
+    {
+      "clip_id": "1ae17e2a-bc07-4e57-a04b-e9d5a372cd1e",
+      "t0_relative": 5784920,
+      "full_seconds": 2.7695,
+      "fast_seconds": 0.7263,
+      "speedup_x": 3.8134,
+      "full_ade_m": 5.1199,
+      "fast_ade_m": 7.0886,
+      "ade_delta_m": 1.9687,
+      "fast_vs_full_ade_m": 7.116,
+      "fast_vs_full_fde_m": 20.8918,
+      "full_sanity": {
+        "finite": true,
+        "within_bounds": true,
+        "accel_abs_max": 2.7355356216430664,
+        "curvature_abs_max": 4.10112190246582
+      },
+      "fast_sanity": {
+        "finite": true,
+        "within_bounds": true,
+        "accel_abs_max": 2.045670509338379,
+        "curvature_abs_max": 2.92694091796875
+      }
+    },
+    {
+      "clip_id": "f2205e0b-b16f-491d-a211-e65db71d4f1c",
+      "t0_relative": 10000000,
+      "full_seconds": 1.2949,
+      "fast_seconds": 0.7844,
+      "speedup_x": 1.6509,
+      "full_ade_m": 1.2151,
+      "fast_ade_m": 3.3884,
+      "ade_delta_m": 2.1733,
+      "fast_vs_full_ade_m": 2.6087,
+      "fast_vs_full_fde_m": 8.7704,
+      "full_sanity": {
+        "finite": true,
+        "within_bounds": true,
+        "accel_abs_max": 1.3257277011871338,
+        "curvature_abs_max": 2.5645663738250732
+      },
+      "fast_sanity": {
+        "finite": true,
+        "within_bounds": true,
+        "accel_abs_max": 1.2041693925857544,
+        "curvature_abs_max": 1.650020718574524
+      }
+    },
+    {
+      "clip_id": "70d71413-d377-4836-ae6a-72f3b3bb5c49",
+      "t0_relative": 8000000,
+      "full_seconds": 1.6693,
+      "fast_seconds": 0.7253,
+      "speedup_x": 2.3016,
+      "full_ade_m": 4.5189,
+      "fast_ade_m": 3.6328,
+      "ade_delta_m": -0.8861,
+      "fast_vs_full_ade_m": 1.1661,
+      "fast_vs_full_fde_m": 4.5474,
+      "full_sanity": {
+        "finite": true,
+        "within_bounds": true,
+        "accel_abs_max": 1.473867654800415,
+        "curvature_abs_max": 2.5331106185913086
+      },
+      "fast_sanity": {
+        "finite": true,
+        "within_bounds": true,
+        "accel_abs_max": 1.6955480575561523,
+        "curvature_abs_max": 2.1021857261657715
+      }
+    },
+    {
+      "clip_id": "709fe679-4f3e-4938-8767-23886741c6bc",
+      "t0_relative": 11000000,
+      "full_seconds": 1.6634,
+      "fast_seconds": 0.7014,
+      "speedup_x": 2.3716,
+      "full_ade_m": 2.8396,
+      "fast_ade_m": 3.692,
+      "ade_delta_m": 0.8524,
+      "fast_vs_full_ade_m": 1.3304,
+      "fast_vs_full_fde_m": 5.2339,
+      "full_sanity": {
+        "finite": true,
+        "within_bounds": true,
+        "accel_abs_max": 2.1483962535858154,
+        "curvature_abs_max": 1.3891658782958984
+      },
+      "fast_sanity": {
+        "finite": true,
+        "within_bounds": true,
+        "accel_abs_max": 1.2409743070602417,
+        "curvature_abs_max": 1.1884108781814575
+      }
+    },
+    {
+      "clip_id": "8455d8a6-3c18-473b-90fd-a89038684c6f",
+      "t0_relative": 10000000,
+      "full_seconds": 1.6245,
+      "fast_seconds": 0.6897,
+      "speedup_x": 2.3553,
+      "full_ade_m": 0.4499,
+      "fast_ade_m": 3.2129,
+      "ade_delta_m": 2.763,
+      "fast_vs_full_ade_m": 3.0562,
+      "fast_vs_full_fde_m": 8.1747,
+      "full_sanity": {
+        "finite": true,
+        "within_bounds": true,
+        "accel_abs_max": 2.1040420532226562,
+        "curvature_abs_max": 3.281752347946167
+      },
+      "fast_sanity": {
+        "finite": true,
+        "within_bounds": true,
+        "accel_abs_max": 1.5573492050170898,
+        "curvature_abs_max": 2.5517139434814453
+      }
+    }
+  ]
+}

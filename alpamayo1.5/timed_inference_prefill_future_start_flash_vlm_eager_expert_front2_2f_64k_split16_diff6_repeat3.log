@@ -1,0 +1,48 @@
+flash_attn_ok /mnt/g/alpamayo1.5/a1_5_venv/lib/python3.12/site-packages/flash_attn/__init__.py
+torch 2.8.0+cu128
+cuda_available True
+cuda_device_count 2
+gpu_initial {0: {'used_gib': 1.11, 'free_gib': 14.49, 'total_gib': 15.6}, 1: {'used_gib': 1.11, 'free_gib': 14.49, 'total_gib': 15.6}}
+camera_mode front2
+num_frames 2
+gpu_mem_gib 15
+cpu_mem_gib 96
+min_pixels 65536
+max_pixels 65536
+device_map_mode manual_split
+split_index 16
+repeat_infer 3
+diffusion_steps 6
+attn_implementation flash_attention_2
+expert_attn_implementation eager
+reasoning_mode prefill_future_start
+dataset_seconds 7.48
+image_frames_shape (2, 2, 3, 1080, 1920)
+camera_indices [1, 6]
+messages_seconds 0.0
+Flash Attention 2 only supports torch.float16 and torch.bfloat16 dtypes, but the current dype in Qwen3VLForConditionalGeneration is bfloat16. You should run training or inference using Automatic Mixed-Precision via the `with torch.autocast(device_type='torch_device'):` decorator, or load the model with the `dtype` argument. Example: `model = AutoModel.from_pretrained("openai/whisper-tiny", attn_implementation="flash_attention_2", dtype=torch.float16)`
+Flash Attention 2 only supports torch.float16 and torch.bfloat16 dtypes, but the current dype in Qwen3VLModel is bfloat16. You should run training or inference using Automatic Mixed-Precision via the `with torch.autocast(device_type='torch_device'):` decorator, or load the model with the `dtype` argument. Example: `model = AutoModel.from_pretrained("openai/whisper-tiny", attn_implementation="flash_attention_2", dtype=torch.float16)`
+You are attempting to use Flash Attention 2 without specifying a torch dtype. This might lead to unexpected behaviour
+Loading checkpoint shards:   0%|          | 0/5 [00:00<?, ?it/s]Loading checkpoint shards:  20%|██        | 1/5 [00:11<00:47, 11.90s/it]Loading checkpoint shards:  40%|████      | 2/5 [00:24<00:36, 12.15s/it]Loading checkpoint shards:  60%|██████    | 3/5 [00:35<00:23, 11.96s/it]Loading checkpoint shards:  80%|████████  | 4/5 [00:47<00:11, 11.96s/it]Loading checkpoint shards: 100%|██████████| 5/5 [00:54<00:00, 10.17s/it]Loading checkpoint shards: 100%|██████████| 5/5 [00:54<00:00, 10.99s/it]
+model_load_seconds 60.42
+model_device cuda:0
+hf_device_map {'vlm.model.visual': 0, 'vlm.model.language_model.embed_tokens': 0, 'vlm.model.language_model.norm': 1, 'vlm.model.language_model.rotary_emb': 1, 'vlm.lm_head': 1, 'expert.norm': 1, 'expert.rotary_emb': 1, 'action_in_proj': 0, 'action_out_proj': 1, 'action_space': 0, 'diffusion': 0, 'vlm.model.language_model.layers.0': 0, 'expert.layers.0': 0, 'vlm.model.language_model.layers.1': 0, 'expert.layers.1': 0, 'vlm.model.language_model.layers.2': 0, 'expert.layers.2': 0, 'vlm.model.language_model.layers.3': 0, 'expert.layers.3': 0, 'vlm.model.language_model.layers.4': 0, 'expert.layers.4': 0, 'vlm.model.language_model.layers.5': 0, 'expert.layers.5': 0, 'vlm.model.language_model.layers.6': 0, 'expert.layers.6': 0, 'vlm.model.language_model.layers.7': 0, 'expert.layers.7': 0, 'vlm.model.language_model.layers.8': 0, 'expert.layers.8': 0, 'vlm.model.language_model.layers.9': 0, 'expert.layers.9': 0, 'vlm.model.language_model.layers.10': 0, 'expert.layers.10': 0, 'vlm.model.language_model.layers.11': 0, 'expert.layers.11': 0, 'vlm.model.language_model.layers.12': 0, 'expert.layers.12': 0, 'vlm.model.language_model.layers.13': 0, 'expert.layers.13': 0, 'vlm.model.language_model.layers.14': 0, 'expert.layers.14': 0, 'vlm.model.language_model.layers.15': 0, 'expert.layers.15': 0, 'vlm.model.language_model.layers.16': 1, 'expert.layers.16': 1, 'vlm.model.language_model.layers.17': 1, 'expert.layers.17': 1, 'vlm.model.language_model.layers.18': 1, 'expert.layers.18': 1, 'vlm.model.language_model.layers.19': 1, 'expert.layers.19': 1, 'vlm.model.language_model.layers.20': 1, 'expert.layers.20': 1, 'vlm.model.language_model.layers.21': 1, 'expert.layers.21': 1, 'vlm.model.language_model.layers.22': 1, 'expert.layers.22': 1, 'vlm.model.language_model.layers.23': 1, 'expert.layers.23': 1, 'vlm.model.language_model.layers.24': 1, 'expert.layers.24': 1, 'vlm.model.language_model.layers.25': 1, 'expert.layers.25': 1, 'vlm.model.language_model.layers.26': 1, 'expert.layers.26': 1, 'vlm.model.language_model.layers.27': 1, 'expert.layers.27': 1, 'vlm.model.language_model.layers.28': 1, 'expert.layers.28': 1, 'vlm.model.language_model.layers.29': 1, 'expert.layers.29': 1, 'vlm.model.language_model.layers.30': 1, 'expert.layers.30': 1, 'vlm.model.language_model.layers.31': 1, 'expert.layers.31': 1, 'vlm.model.language_model.layers.32': 1, 'expert.layers.32': 1, 'vlm.model.language_model.layers.33': 1, 'expert.layers.33': 1, 'vlm.model.language_model.layers.34': 1, 'expert.layers.34': 1, 'vlm.model.language_model.layers.35': 1, 'expert.layers.35': 1}
+gpu_post_load {0: {'used_gib': 11.02, 'free_gib': 4.58, 'total_gib': 15.6}, 1: {'used_gib': 11.91, 'free_gib': 3.69, 'total_gib': 15.6}}
+processor_seconds 2.33
+input_ids_shape (1, 828)
+move_inputs_seconds 0.0
+gpu_pre_infer {0: {'used_gib': 11.03, 'free_gib': 4.57, 'total_gib': 15.6}, 1: {'used_gib': 11.91, 'free_gib': 3.69, 'total_gib': 15.6}}
+infer_seconds_0 1.52
+runtime_profile_0 {'vlm_generate_seconds': 1.05587592400002, 'expert_step_calls': 6, 'expert_step_seconds': 0.3062864239999499, 'diffusion_seconds': 0.3098385060000055, 'generated_sequence_length': 828, 'prefill_seq_len': 828, 'total_seconds': 1.5202502549999508}
+infer_seconds_1 0.65
+runtime_profile_1 {'vlm_generate_seconds': 0.3828649280000036, 'expert_step_calls': 6, 'expert_step_seconds': 0.24833330100022977, 'diffusion_seconds': 0.24899705799998628, 'generated_sequence_length': 828, 'prefill_seq_len': 828, 'total_seconds': 0.6483144080000329}
+infer_seconds_2 0.66
+runtime_profile_2 {'vlm_generate_seconds': 0.3847964349999984, 'expert_step_calls': 6, 'expert_step_seconds': 0.2713172469999563, 'diffusion_seconds': 0.27206973799991374, 'generated_sequence_length': 828, 'prefill_seq_len': 828, 'total_seconds': 0.660998505000066}
+infer_seconds_mean 0.94
+gpu_post_infer {0: {'used_gib': 11.45, 'free_gib': 4.15, 'total_gib': 15.6}, 1: {'used_gib': 15.6, 'free_gib': 0.0, 'total_gib': 15.6}}
+min_ade_m 1.2092
+pred_xyz_shape (1, 1, 1, 64, 3)
+pred_rot_shape (1, 1, 1, 64, 3, 3)
+cot_chars 0
+cot_preview <not generated>
+overall_seconds 73.07

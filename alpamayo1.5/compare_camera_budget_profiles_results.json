@@ -1,0 +1,1682 @@
+{
+  "summary": {
+    "equal_64k": {
+      "num_samples": 5,
+      "mean_seconds": 0.6701,
+      "mean_image_tokens": 648.0,
+      "mean_ade_m": 3.687,
+      "mean_longitudinal_mae_m": 1.6726,
+      "mean_lateral_mae_m": 3.0766,
+      "mean_endpoint_longitudinal_abs_m": 4.0879,
+      "mean_endpoint_lateral_abs_m": 10.3894,
+      "all_finite": true,
+      "all_within_bounds": true
+    },
+    "wide_80k_tele_48k": {
+      "num_samples": 5,
+      "mean_seconds": 0.7211,
+      "mean_image_tokens": 684.0,
+      "mean_ade_m": 4.1742,
+      "mean_longitudinal_mae_m": 1.9353,
+      "mean_lateral_mae_m": 3.3395,
+      "mean_endpoint_longitudinal_abs_m": 2.7792,
+      "mean_endpoint_lateral_abs_m": 11.4059,
+      "all_finite": true,
+      "all_within_bounds": true
+    },
+    "wide_96k_tele_32k": {
+      "num_samples": 5,
+      "mean_seconds": 0.7007,
+      "mean_image_tokens": 664.0,
+      "mean_ade_m": 4.6466,
+      "mean_longitudinal_mae_m": 1.4852,
+      "mean_lateral_mae_m": 4.2043,
+      "mean_endpoint_longitudinal_abs_m": 4.9398,
+      "mean_endpoint_lateral_abs_m": 14.1175,
+      "all_finite": true,
+      "all_within_bounds": true
+    },
+    "wide_112k_tele_16k": {
+      "num_samples": 5,
+      "mean_seconds": 0.7129,
+      "mean_image_tokens": 664.0,
+      "mean_ade_m": 4.9421,
+      "mean_longitudinal_mae_m": 2.2844,
+      "mean_lateral_mae_m": 4.1516,
+      "mean_endpoint_longitudinal_abs_m": 4.4475,
+      "mean_endpoint_lateral_abs_m": 14.2855,
+      "all_finite": true,
+      "all_within_bounds": true
+    }
+  },
+  "results_by_profile": {
+    "equal_64k": [
+      {
+        "profile": "equal_64k",
+        "clip_id": "1ae17e2a-bc07-4e57-a04b-e9d5a372cd1e",
+        "t0_relative": 5784920,
+        "seconds": 0.6776,
+        "image_tokens": 648,
+        "ade_m": 7.8532,
+        "longitudinal_mae_m": 2.2881,
+        "lateral_mae_m": 7.4183,
+        "endpoint_longitudinal_abs_m": 11.9588,
+        "endpoint_lateral_abs_m": 27.6102,
+        "resize_stats": [
+          {
+            "camera_index": 1,
+            "input_hw": [
+              1080,
+              1920
+            ],
+            "output_hw": [
+              168,
+              336
+            ],
+            "target_pixels": 65536,
+            "output_pixels": 56448
+          },
+          {
+            "camera_index": 6,
+            "input_hw": [
+              1080,
+              1920
+            ],
+            "output_hw": [
+              168,
+              336
+            ],
+            "target_pixels": 65536,
+            "output_pixels": 56448
+          }
+        ],
+        "image_grid_thw": [
+          [
+            1,
+            18,
+            36
+          ],
+          [
+            1,
+            18,
+            36
+          ],
+          [
+            1,
+            18,
+            36
+          ],
+          [
+            1,
+            18,
+            36
+          ]
+        ],
+        "input_ids_shape": [
+          1,
+          761
+        ],
+        "runtime_profile": {
+          "vlm_generate_seconds": 0.38094782699999996,
+          "expert_step_calls": 6,
+          "expert_step_seconds": 0.28717190599999753,
+          "diffusion_seconds": 0.28795972800000413,
+          "generated_sequence_length": 761,
+          "prefill_seq_len": 761,
+          "total_seconds": 0.6773874929999977
+        },
+        "sanity": {
+          "finite": true,
+          "within_bounds": true,
+          "accel_abs_max": 2.156092882156372,
+          "curvature_abs_max": 0.3231255114078522
+        }
+      },
+      {
+        "profile": "equal_64k",
+        "clip_id": "f2205e0b-b16f-491d-a211-e65db71d4f1c",
+        "t0_relative": 10000000,
+        "seconds": 0.652,
+        "image_tokens": 648,
+        "ade_m": 2.0052,
+        "longitudinal_mae_m": 1.7509,
+        "lateral_mae_m": 0.8891,
+        "endpoint_longitudinal_abs_m": 2.8058,
+        "endpoint_lateral_abs_m": 0.7607,
+        "resize_stats": [
+          {
+            "camera_index": 1,
+            "input_hw": [
+              1080,
+              1920
+            ],
+            "output_hw": [
+              168,
+              336
+            ],
+            "target_pixels": 65536,
+            "output_pixels": 56448
+          },
+          {
+            "camera_index": 6,
+            "input_hw": [
+              1080,
+              1920
+            ],
+            "output_hw": [
+              168,
+              336
+            ],
+            "target_pixels": 65536,
+            "output_pixels": 56448
+          }
+        ],
+        "image_grid_thw": [
+          [
+            1,
+            18,
+            36
+          ],
+          [
+            1,
+            18,
+            36
+          ],
+          [
+            1,
+            18,
+            36
+          ],
+          [
+            1,
+            18,
+            36
+          ]
+        ],
+        "input_ids_shape": [
+          1,
+          761
+        ],
+        "runtime_profile": {
+          "vlm_generate_seconds": 0.38064370300000405,
+          "expert_step_calls": 6,
+          "expert_step_seconds": 0.25663401200000635,
+          "diffusion_seconds": 0.25740130900001645,
+          "generated_sequence_length": 761,
+          "prefill_seq_len": 761,
+          "total_seconds": 0.6518146240000249
+        },
+        "sanity": {
+          "finite": true,
+          "within_bounds": true,
+          "accel_abs_max": 1.5288572311401367,
+          "curvature_abs_max": 1.943281888961792
+        }
+      },
+      {
+        "profile": "equal_64k",
+        "clip_id": "70d71413-d377-4836-ae6a-72f3b3bb5c49",
+        "t0_relative": 8000000,
+        "seconds": 0.6578,
+        "image_tokens": 648,
+        "ade_m": 2.7996,
+        "longitudinal_mae_m": 1.7355,
+        "lateral_mae_m": 2.1061,
+        "endpoint_longitudinal_abs_m": 3.173,
+        "endpoint_lateral_abs_m": 9.0574,
+        "resize_stats": [
+          {
+            "camera_index": 1,
+            "input_hw": [
+              1080,
+              1920
+            ],
+            "output_hw": [
+              168,
+              336
+            ],
+            "target_pixels": 65536,
+            "output_pixels": 56448
+          },
+          {
+            "camera_index": 6,
+            "input_hw": [
+              1080,
+              1920
+            ],
+            "output_hw": [
+              168,
+              336
+            ],
+            "target_pixels": 65536,
+            "output_pixels": 56448
+          }
+        ],
+        "image_grid_thw": [
+          [
+            1,
+            18,
+            36
+          ],
+          [
+            1,
+            18,
+            36
+          ],
+          [
+            1,
+            18,
+            36
+          ],
+          [
+            1,
+            18,
+            36
+          ]
+        ],
+        "input_ids_shape": [
+          1,
+          761
+        ],
+        "runtime_profile": {
+          "vlm_generate_seconds": 0.38062495599999124,
+          "expert_step_calls": 6,
+          "expert_step_seconds": 0.26103362799997853,
+          "diffusion_seconds": 0.2617592280000167,
+          "generated_sequence_length": 761,
+          "prefill_seq_len": 761,
+          "total_seconds": 0.6576036300000112
+        },
+        "sanity": {
+          "finite": true,
+          "within_bounds": true,
+          "accel_abs_max": 1.9347671270370483,
+          "curvature_abs_max": 1.9516167640686035
+        }
+      },
+      {
+        "profile": "equal_64k",
+        "clip_id": "709fe679-4f3e-4938-8767-23886741c6bc",
+        "t0_relative": 11000000,
+        "seconds": 0.6897,
+        "image_tokens": 648,
+        "ade_m": 1.4434,
+        "longitudinal_mae_m": 0.7106,
+        "lateral_mae_m": 1.2313,
+        "endpoint_longitudinal_abs_m": 0.4576,
+        "endpoint_lateral_abs_m": 3.298,
+        "resize_stats": [
+          {
+            "camera_index": 1,
+            "input_hw": [
+              1080,
+              1920
+            ],
+            "output_hw": [
+              168,
+              336
+            ],
+            "target_pixels": 65536,
+            "output_pixels": 56448
+          },
+          {
+            "camera_index": 6,
+            "input_hw": [
+              1080,
+              1920
+            ],
+            "output_hw": [
+              168,
+              336
+            ],
+            "target_pixels": 65536,
+            "output_pixels": 56448
+          }
+        ],
+        "image_grid_thw": [
+          [
+            1,
+            18,
+            36
+          ],
+          [
+            1,
+            18,
+            36
+          ],
+          [
+            1,
+            18,
+            36
+          ],
+          [
+            1,
+            18,
+            36
+          ]
+        ],
+        "input_ids_shape": [
+          1,
+          761
+        ],
+        "runtime_profile": {
+          "vlm_generate_seconds": 0.3886286000000041,
+          "expert_step_calls": 6,
+          "expert_step_seconds": 0.2951934000000165,
+          "diffusion_seconds": 0.29610719999999446,
+          "generated_sequence_length": 761,
+          "prefill_seq_len": 761,
+          "total_seconds": 0.6895120000000077
+        },
+        "sanity": {
+          "finite": true,
+          "within_bounds": true,
+          "accel_abs_max": 1.9675288200378418,
+          "curvature_abs_max": 1.6442923545837402
+        }
+      },
+      {
+        "profile": "equal_64k",
+        "clip_id": "8455d8a6-3c18-473b-90fd-a89038684c6f",
+        "t0_relative": 10000000,
+        "seconds": 0.6734,
+        "image_tokens": 648,
+        "ade_m": 4.3336,
+        "longitudinal_mae_m": 1.8779,
+        "lateral_mae_m": 3.738,
+        "endpoint_longitudinal_abs_m": 2.0445,
+        "endpoint_lateral_abs_m": 11.2206,
+        "resize_stats": [
+          {
+            "camera_index": 1,
+            "input_hw": [
+              1080,
+              1920
+            ],
+            "output_hw": [
+              168,
+              336
+            ],
+            "target_pixels": 65536,
+            "output_pixels": 56448
+          },
+          {
+            "camera_index": 6,
+            "input_hw": [
+              1080,
+              1920
+            ],
+            "output_hw": [
+              168,
+              336
+            ],
+            "target_pixels": 65536,
+            "output_pixels": 56448
+          }
+        ],
+        "image_grid_thw": [
+          [
+            1,
+            18,
+            36
+          ],
+          [
+            1,
+            18,
+            36
+          ],
+          [
+            1,
+            18,
+            36
+          ],
+          [
+            1,
+            18,
+            36
+          ]
+        ],
+        "input_ids_shape": [
+          1,
+          761
+        ],
+        "runtime_profile": {
+          "vlm_generate_seconds": 0.38146615800002337,
+          "expert_step_calls": 6,
+          "expert_step_seconds": 0.28807398400005013,
+          "diffusion_seconds": 0.28889514600001576,
+          "generated_sequence_length": 761,
+          "prefill_seq_len": 761,
+          "total_seconds": 0.6732777720000058
+        },
+        "sanity": {
+          "finite": true,
+          "within_bounds": true,
+          "accel_abs_max": 0.8732132315635681,
+          "curvature_abs_max": 4.582255840301514
+        }
+      }
+    ],
+    "wide_80k_tele_48k": [
+      {
+        "profile": "wide_80k_tele_48k",
+        "clip_id": "1ae17e2a-bc07-4e57-a04b-e9d5a372cd1e",
+        "t0_relative": 5784920,
+        "seconds": 0.7719,
+        "image_tokens": 684,
+        "ade_m": 8.3513,
+        "longitudinal_mae_m": 3.4773,
+        "lateral_mae_m": 6.9985,
+        "endpoint_longitudinal_abs_m": 2.3549,
+        "endpoint_lateral_abs_m": 25.7257,
+        "resize_stats": [
+          {
+            "camera_index": 1,
+            "input_hw": [
+              1080,
+              1920
+            ],
+            "output_hw": [
+              196,
+              364
+            ],
+            "target_pixels": 81920,
+            "output_pixels": 71344
+          },
+          {
+            "camera_index": 6,
+            "input_hw": [
+              1080,
+              1920
+            ],
+            "output_hw": [
+              140,
+              280
+            ],
+            "target_pixels": 49152,
+            "output_pixels": 39200
+          }
+        ],
+        "image_grid_thw": [
+          [
+            1,
+            20,
+            36
+          ],
+          [
+            1,
+            20,
+            36
+          ],
+          [
+            1,
+            18,
+            36
+          ],
+          [
+            1,
+            18,
+            36
+          ]
+        ],
+        "input_ids_shape": [
+          1,
+          797
+        ],
+        "runtime_profile": {
+          "vlm_generate_seconds": 0.4374321429999952,
+          "expert_step_calls": 6,
+          "expert_step_seconds": 0.3261271280000244,
+          "diffusion_seconds": 0.3268947929999797,
+          "generated_sequence_length": 797,
+          "prefill_seq_len": 797,
+          "total_seconds": 0.7717376219999892
+        },
+        "sanity": {
+          "finite": true,
+          "within_bounds": true,
+          "accel_abs_max": 1.369005799293518,
+          "curvature_abs_max": 0.3220160901546478
+        }
+      },
+      {
+        "profile": "wide_80k_tele_48k",
+        "clip_id": "f2205e0b-b16f-491d-a211-e65db71d4f1c",
+        "t0_relative": 10000000,
+        "seconds": 0.7231,
+        "image_tokens": 684,
+        "ade_m": 1.3552,
+        "longitudinal_mae_m": 1.2967,
+        "lateral_mae_m": 0.2119,
+        "endpoint_longitudinal_abs_m": 5.1223,
+        "endpoint_lateral_abs_m": 0.0618,
+        "resize_stats": [
+          {
+            "camera_index": 1,
+            "input_hw": [
+              1080,
+              1920
+            ],
+            "output_hw": [
+              196,
+              364
+            ],
+            "target_pixels": 81920,
+            "output_pixels": 71344
+          },
+          {
+            "camera_index": 6,
+            "input_hw": [
+              1080,
+              1920
+            ],
+            "output_hw": [
+              140,
+              280
+            ],
+            "target_pixels": 49152,
+            "output_pixels": 39200
+          }
+        ],
+        "image_grid_thw": [
+          [
+            1,
+            20,
+            36
+          ],
+          [
+            1,
+            20,
+            36
+          ],
+          [
+            1,
+            18,
+            36
+          ],
+          [
+            1,
+            18,
+            36
+          ]
+        ],
+        "input_ids_shape": [
+          1,
+          797
+        ],
+        "runtime_profile": {
+          "vlm_generate_seconds": 0.4293455730000062,
+          "expert_step_calls": 6,
+          "expert_step_seconds": 0.27486820600003625,
+          "diffusion_seconds": 0.2756601369999885,
+          "generated_sequence_length": 797,
+          "prefill_seq_len": 797,
+          "total_seconds": 0.7229423570000222
+        },
+        "sanity": {
+          "finite": true,
+          "within_bounds": true,
+          "accel_abs_max": 2.121807098388672,
+          "curvature_abs_max": 1.392871618270874
+        }
+      },
+      {
+        "profile": "wide_80k_tele_48k",
+        "clip_id": "70d71413-d377-4836-ae6a-72f3b3bb5c49",
+        "t0_relative": 8000000,
+        "seconds": 0.6899,
+        "image_tokens": 684,
+        "ade_m": 1.5182,
+        "longitudinal_mae_m": 0.7428,
+        "lateral_mae_m": 1.3124,
+        "endpoint_longitudinal_abs_m": 2.1301,
+        "endpoint_lateral_abs_m": 4.4223,
+        "resize_stats": [
+          {
+            "camera_index": 1,
+            "input_hw": [
+              1080,
+              1920
+            ],
+            "output_hw": [
+              196,
+              364
+            ],
+            "target_pixels": 81920,
+            "output_pixels": 71344
+          },
+          {
+            "camera_index": 6,
+            "input_hw": [
+              1080,
+              1920
+            ],
+            "output_hw": [
+              140,
+              280
+            ],
+            "target_pixels": 49152,
+            "output_pixels": 39200
+          }
+        ],
+        "image_grid_thw": [
+          [
+            1,
+            20,
+            36
+          ],
+          [
+            1,
+            20,
+            36
+          ],
+          [
+            1,
+            18,
+            36
+          ],
+          [
+            1,
+            18,
+            36
+          ]
+        ],
+        "input_ids_shape": [
+          1,
+          797
+        ],
+        "runtime_profile": {
+          "vlm_generate_seconds": 0.3952467860000013,
+          "expert_step_calls": 6,
+          "expert_step_seconds": 0.2910067779999963,
+          "diffusion_seconds": 0.2919849959999965,
+          "generated_sequence_length": 797,
+          "prefill_seq_len": 797,
+          "total_seconds": 0.6897880829999963
+        },
+        "sanity": {
+          "finite": true,
+          "within_bounds": true,
+          "accel_abs_max": 2.9621825218200684,
+          "curvature_abs_max": 3.284564971923828
+        }
+      },
+      {
+        "profile": "wide_80k_tele_48k",
+        "clip_id": "709fe679-4f3e-4938-8767-23886741c6bc",
+        "t0_relative": 11000000,
+        "seconds": 0.6912,
+        "image_tokens": 684,
+        "ade_m": 2.9006,
+        "longitudinal_mae_m": 1.2275,
+        "lateral_mae_m": 2.4175,
+        "endpoint_longitudinal_abs_m": 1.7859,
+        "endpoint_lateral_abs_m": 8.053,
+        "resize_stats": [
+          {
+            "camera_index": 1,
+            "input_hw": [
+              1080,
+              1920
+            ],
+            "output_hw": [
+              196,
+              364
+            ],
+            "target_pixels": 81920,
+            "output_pixels": 71344
+          },
+          {
+            "camera_index": 6,
+            "input_hw": [
+              1080,
+              1920
+            ],
+            "output_hw": [
+              140,
+              280
+            ],
+            "target_pixels": 49152,
+            "output_pixels": 39200
+          }
+        ],
+        "image_grid_thw": [
+          [
+            1,
+            20,
+            36
+          ],
+          [
+            1,
+            20,
+            36
+          ],
+          [
+            1,
+            18,
+            36
+          ],
+          [
+            1,
+            18,
+            36
+          ]
+        ],
+        "input_ids_shape": [
+          1,
+          797
+        ],
+        "runtime_profile": {
+          "vlm_generate_seconds": 0.4126351570000111,
+          "expert_step_calls": 6,
+          "expert_step_seconds": 0.2720001549999438,
+          "diffusion_seconds": 0.27280207999999107,
+          "generated_sequence_length": 797,
+          "prefill_seq_len": 797,
+          "total_seconds": 0.6910223060000078
+        },
+        "sanity": {
+          "finite": true,
+          "within_bounds": true,
+          "accel_abs_max": 1.6743099689483643,
+          "curvature_abs_max": 1.1624411344528198
+        }
+      },
+      {
+        "profile": "wide_80k_tele_48k",
+        "clip_id": "8455d8a6-3c18-473b-90fd-a89038684c6f",
+        "t0_relative": 10000000,
+        "seconds": 0.7295,
+        "image_tokens": 684,
+        "ade_m": 6.7457,
+        "longitudinal_mae_m": 2.9321,
+        "lateral_mae_m": 5.7572,
+        "endpoint_longitudinal_abs_m": 2.5027,
+        "endpoint_lateral_abs_m": 18.7668,
+        "resize_stats": [
+          {
+            "camera_index": 1,
+            "input_hw": [
+              1080,
+              1920
+            ],
+            "output_hw": [
+              196,
+              364
+            ],
+            "target_pixels": 81920,
+            "output_pixels": 71344
+          },
+          {
+            "camera_index": 6,
+            "input_hw": [
+              1080,
+              1920
+            ],
+            "output_hw": [
+              140,
+              280
+            ],
+            "target_pixels": 49152,
+            "output_pixels": 39200
+          }
+        ],
+        "image_grid_thw": [
+          [
+            1,
+            20,
+            36
+          ],
+          [
+            1,
+            20,
+            36
+          ],
+          [
+            1,
+            18,
+            36
+          ],
+          [
+            1,
+            18,
+            36
+          ]
+        ],
+        "input_ids_shape": [
+          1,
+          797
+        ],
+        "runtime_profile": {
+          "vlm_generate_seconds": 0.421241737999992,
+          "expert_step_calls": 6,
+          "expert_step_seconds": 0.30290285299997777,
+          "diffusion_seconds": 0.30393966100001535,
+          "generated_sequence_length": 797,
+          "prefill_seq_len": 797,
+          "total_seconds": 0.7292700050000462
+        },
+        "sanity": {
+          "finite": true,
+          "within_bounds": true,
+          "accel_abs_max": 0.7776857614517212,
+          "curvature_abs_max": 2.7077975273132324
+        }
+      }
+    ],
+    "wide_96k_tele_32k": [
+      {
+        "profile": "wide_96k_tele_32k",
+        "clip_id": "1ae17e2a-bc07-4e57-a04b-e9d5a372cd1e",
+        "t0_relative": 5784920,
+        "seconds": 0.7039,
+        "image_tokens": 664,
+        "ade_m": 7.5403,
+        "longitudinal_mae_m": 1.2656,
+        "lateral_mae_m": 7.3218,
+        "endpoint_longitudinal_abs_m": 6.3297,
+        "endpoint_lateral_abs_m": 26.7573,
+        "resize_stats": [
+          {
+            "camera_index": 1,
+            "input_hw": [
+              1080,
+              1920
+            ],
+            "output_hw": [
+              224,
+              392
+            ],
+            "target_pixels": 98304,
+            "output_pixels": 87808
+          },
+          {
+            "camera_index": 6,
+            "input_hw": [
+              1080,
+              1920
+            ],
+            "output_hw": [
+              112,
+              224
+            ],
+            "target_pixels": 32768,
+            "output_pixels": 25088
+          }
+        ],
+        "image_grid_thw": [
+          [
+            1,
+            20,
+            34
+          ],
+          [
+            1,
+            20,
+            34
+          ],
+          [
+            1,
+            18,
+            36
+          ],
+          [
+            1,
+            18,
+            36
+          ]
+        ],
+        "input_ids_shape": [
+          1,
+          777
+        ],
+        "runtime_profile": {
+          "vlm_generate_seconds": 0.4154671289999783,
+          "expert_step_calls": 6,
+          "expert_step_seconds": 0.27998393499996155,
+          "diffusion_seconds": 0.28078761099999383,
+          "generated_sequence_length": 777,
+          "prefill_seq_len": 777,
+          "total_seconds": 0.7038030080000226
+        },
+        "sanity": {
+          "finite": true,
+          "within_bounds": true,
+          "accel_abs_max": 1.9444937705993652,
+          "curvature_abs_max": 0.4471978545188904
+        }
+      },
+      {
+        "profile": "wide_96k_tele_32k",
+        "clip_id": "f2205e0b-b16f-491d-a211-e65db71d4f1c",
+        "t0_relative": 10000000,
+        "seconds": 0.6959,
+        "image_tokens": 664,
+        "ade_m": 3.4823,
+        "longitudinal_mae_m": 1.6252,
+        "lateral_mae_m": 3.0603,
+        "endpoint_longitudinal_abs_m": 5.0266,
+        "endpoint_lateral_abs_m": 6.4782,
+        "resize_stats": [
+          {
+            "camera_index": 1,
+            "input_hw": [
+              1080,
+              1920
+            ],
+            "output_hw": [
+              224,
+              392
+            ],
+            "target_pixels": 98304,
+            "output_pixels": 87808
+          },
+          {
+            "camera_index": 6,
+            "input_hw": [
+              1080,
+              1920
+            ],
+            "output_hw": [
+              112,
+              224
+            ],
+            "target_pixels": 32768,
+            "output_pixels": 25088
+          }
+        ],
+        "image_grid_thw": [
+          [
+            1,
+            20,
+            34
+          ],
+          [
+            1,
+            20,
+            34
+          ],
+          [
+            1,
+            18,
+            36
+          ],
+          [
+            1,
+            18,
+            36
+          ]
+        ],
+        "input_ids_shape": [
+          1,
+          777
+        ],
+        "runtime_profile": {
+          "vlm_generate_seconds": 0.4131459360000065,
+          "expert_step_calls": 6,
+          "expert_step_seconds": 0.26628710900001806,
+          "diffusion_seconds": 0.26706773900002645,
+          "generated_sequence_length": 777,
+          "prefill_seq_len": 777,
+          "total_seconds": 0.6957413750000114
+        },
+        "sanity": {
+          "finite": true,
+          "within_bounds": true,
+          "accel_abs_max": 0.6357603669166565,
+          "curvature_abs_max": 1.531643271446228
+        }
+      },
+      {
+        "profile": "wide_96k_tele_32k",
+        "clip_id": "70d71413-d377-4836-ae6a-72f3b3bb5c49",
+        "t0_relative": 8000000,
+        "seconds": 0.741,
+        "image_tokens": 664,
+        "ade_m": 3.8996,
+        "longitudinal_mae_m": 2.7732,
+        "lateral_mae_m": 2.6864,
+        "endpoint_longitudinal_abs_m": 8.7612,
+        "endpoint_lateral_abs_m": 12.6899,
+        "resize_stats": [
+          {
+            "camera_index": 1,
+            "input_hw": [
+              1080,
+              1920
+            ],
+            "output_hw": [
+              224,
+              392
+            ],
+            "target_pixels": 98304,
+            "output_pixels": 87808
+          },
+          {
+            "camera_index": 6,
+            "input_hw": [
+              1080,
+              1920
+            ],
+            "output_hw": [
+              112,
+              224
+            ],
+            "target_pixels": 32768,
+            "output_pixels": 25088
+          }
+        ],
+        "image_grid_thw": [
+          [
+            1,
+            20,
+            34
+          ],
+          [
+            1,
+            20,
+            34
+          ],
+          [
+            1,
+            18,
+            36
+          ],
+          [
+            1,
+            18,
+            36
+          ]
+        ],
+        "input_ids_shape": [
+          1,
+          777
+        ],
+        "runtime_profile": {
+          "vlm_generate_seconds": 0.41653839500000345,
+          "expert_step_calls": 6,
+          "expert_step_seconds": 0.32069926100001567,
+          "diffusion_seconds": 0.3216139440000063,
+          "generated_sequence_length": 777,
+          "prefill_seq_len": 777,
+          "total_seconds": 0.7408793040000035
+        },
+        "sanity": {
+          "finite": true,
+          "within_bounds": true,
+          "accel_abs_max": 1.2994027137756348,
+          "curvature_abs_max": 2.6782517433166504
+        }
+      },
+      {
+        "profile": "wide_96k_tele_32k",
+        "clip_id": "709fe679-4f3e-4938-8767-23886741c6bc",
+        "t0_relative": 11000000,
+        "seconds": 0.6817,
+        "image_tokens": 664,
+        "ade_m": 2.9463,
+        "longitudinal_mae_m": 0.6357,
+        "lateral_mae_m": 2.8456,
+        "endpoint_longitudinal_abs_m": 2.8416,
+        "endpoint_lateral_abs_m": 8.9882,
+        "resize_stats": [
+          {
+            "camera_index": 1,
+            "input_hw": [
+              1080,
+              1920
+            ],
+            "output_hw": [
+              224,
+              392
+            ],
+            "target_pixels": 98304,
+            "output_pixels": 87808
+          },
+          {
+            "camera_index": 6,
+            "input_hw": [
+              1080,
+              1920
+            ],
+            "output_hw": [
+              112,
+              224
+            ],
+            "target_pixels": 32768,
+            "output_pixels": 25088
+          }
+        ],
+        "image_grid_thw": [
+          [
+            1,
+            20,
+            34
+          ],
+          [
+            1,
+            20,
+            34
+          ],
+          [
+            1,
+            18,
+            36
+          ],
+          [
+            1,
+            18,
+            36
+          ]
+        ],
+        "input_ids_shape": [
+          1,
+          777
+        ],
+        "runtime_profile": {
+          "vlm_generate_seconds": 0.40540416399997525,
+          "expert_step_calls": 6,
+          "expert_step_seconds": 0.2580738710000503,
+          "diffusion_seconds": 0.25879661600001214,
+          "generated_sequence_length": 777,
+          "prefill_seq_len": 777,
+          "total_seconds": 0.6815593900000181
+        },
+        "sanity": {
+          "finite": true,
+          "within_bounds": true,
+          "accel_abs_max": 1.4371966123580933,
+          "curvature_abs_max": 1.433311104774475
+        }
+      },
+      {
+        "profile": "wide_96k_tele_32k",
+        "clip_id": "8455d8a6-3c18-473b-90fd-a89038684c6f",
+        "t0_relative": 10000000,
+        "seconds": 0.6811,
+        "image_tokens": 664,
+        "ade_m": 5.3645,
+        "longitudinal_mae_m": 1.1265,
+        "lateral_mae_m": 5.1075,
+        "endpoint_longitudinal_abs_m": 1.7398,
+        "endpoint_lateral_abs_m": 15.6739,
+        "resize_stats": [
+          {
+            "camera_index": 1,
+            "input_hw": [
+              1080,
+              1920
+            ],
+            "output_hw": [
+              224,
+              392
+            ],
+            "target_pixels": 98304,
+            "output_pixels": 87808
+          },
+          {
+            "camera_index": 6,
+            "input_hw": [
+              1080,
+              1920
+            ],
+            "output_hw": [
+              112,
+              224
+            ],
+            "target_pixels": 32768,
+            "output_pixels": 25088
+          }
+        ],
+        "image_grid_thw": [
+          [
+            1,
+            20,
+            34
+          ],
+          [
+            1,
+            20,
+            34
+          ],
+          [
+            1,
+            18,
+            36
+          ],
+          [
+            1,
+            18,
+            36
+          ]
+        ],
+        "input_ids_shape": [
+          1,
+          777
+        ],
+        "runtime_profile": {
+          "vlm_generate_seconds": 0.38674340799997253,
+          "expert_step_calls": 6,
+          "expert_step_seconds": 0.29037909999999556,
+          "diffusion_seconds": 0.29120400800002244,
+          "generated_sequence_length": 777,
+          "prefill_seq_len": 777,
+          "total_seconds": 0.6809042170000339
+        },
+        "sanity": {
+          "finite": true,
+          "within_bounds": true,
+          "accel_abs_max": 1.656712293624878,
+          "curvature_abs_max": 2.9994614124298096
+        }
+      }
+    ],
+    "wide_112k_tele_16k": [
+      {
+        "profile": "wide_112k_tele_16k",
+        "clip_id": "1ae17e2a-bc07-4e57-a04b-e9d5a372cd1e",
+        "t0_relative": 5784920,
+        "seconds": 0.7833,
+        "image_tokens": 664,
+        "ade_m": 8.7129,
+        "longitudinal_mae_m": 4.5031,
+        "lateral_mae_m": 6.9559,
+        "endpoint_longitudinal_abs_m": 6.0856,
+        "endpoint_lateral_abs_m": 25.6365,
+        "resize_stats": [
+          {
+            "camera_index": 1,
+            "input_hw": [
+              1080,
+              1920
+            ],
+            "output_hw": [
+              252,
+              448
+            ],
+            "target_pixels": 114688,
+            "output_pixels": 112896
+          },
+          {
+            "camera_index": 6,
+            "input_hw": [
+              1080,
+              1920
+            ],
+            "output_hw": [
+              84,
+              168
+            ],
+            "target_pixels": 16384,
+            "output_pixels": 14112
+          }
+        ],
+        "image_grid_thw": [
+          [
+            1,
+            20,
+            34
+          ],
+          [
+            1,
+            20,
+            34
+          ],
+          [
+            1,
+            18,
+            36
+          ],
+          [
+            1,
+            18,
+            36
+          ]
+        ],
+        "input_ids_shape": [
+          1,
+          777
+        ],
+        "runtime_profile": {
+          "vlm_generate_seconds": 0.4240334910000172,
+          "expert_step_calls": 6,
+          "expert_step_seconds": 0.3547532070000159,
+          "diffusion_seconds": 0.35586179000000584,
+          "generated_sequence_length": 777,
+          "prefill_seq_len": 777,
+          "total_seconds": 0.7831179259999885
+        },
+        "sanity": {
+          "finite": true,
+          "within_bounds": true,
+          "accel_abs_max": 1.2102484703063965,
+          "curvature_abs_max": 0.6895687580108643
+        }
+      },
+      {
+        "profile": "wide_112k_tele_16k",
+        "clip_id": "f2205e0b-b16f-491d-a211-e65db71d4f1c",
+        "t0_relative": 10000000,
+        "seconds": 0.6876,
+        "image_tokens": 664,
+        "ade_m": 3.4209,
+        "longitudinal_mae_m": 2.4051,
+        "lateral_mae_m": 2.3984,
+        "endpoint_longitudinal_abs_m": 7.5018,
+        "endpoint_lateral_abs_m": 5.425,
+        "resize_stats": [
+          {
+            "camera_index": 1,
+            "input_hw": [
+              1080,
+              1920
+            ],
+            "output_hw": [
+              252,
+              448
+            ],
+            "target_pixels": 114688,
+            "output_pixels": 112896
+          },
+          {
+            "camera_index": 6,
+            "input_hw": [
+              1080,
+              1920
+            ],
+            "output_hw": [
+              84,
+              168
+            ],
+            "target_pixels": 16384,
+            "output_pixels": 14112
+          }
+        ],
+        "image_grid_thw": [
+          [
+            1,
+            20,
+            34
+          ],
+          [
+            1,
+            20,
+            34
+          ],
+          [
+            1,
+            18,
+            36
+          ],
+          [
+            1,
+            18,
+            36
+          ]
+        ],
+        "input_ids_shape": [
+          1,
+          777
+        ],
+        "runtime_profile": {
+          "vlm_generate_seconds": 0.4089152920000174,
+          "expert_step_calls": 6,
+          "expert_step_seconds": 0.2639532069999859,
+          "diffusion_seconds": 0.265100455999999,
+          "generated_sequence_length": 777,
+          "prefill_seq_len": 777,
+          "total_seconds": 0.687444035999988
+        },
+        "sanity": {
+          "finite": true,
+          "within_bounds": true,
+          "accel_abs_max": 0.5584667325019836,
+          "curvature_abs_max": 1.388719081878662
+        }
+      },
+      {
+        "profile": "wide_112k_tele_16k",
+        "clip_id": "70d71413-d377-4836-ae6a-72f3b3bb5c49",
+        "t0_relative": 8000000,
+        "seconds": 0.6967,
+        "image_tokens": 664,
+        "ade_m": 3.5335,
+        "longitudinal_mae_m": 1.3067,
+        "lateral_mae_m": 3.2609,
+        "endpoint_longitudinal_abs_m": 3.2601,
+        "endpoint_lateral_abs_m": 14.1104,
+        "resize_stats": [
+          {
+            "camera_index": 1,
+            "input_hw": [
+              1080,
+              1920
+            ],
+            "output_hw": [
+              252,
+              448
+            ],
+            "target_pixels": 114688,
+            "output_pixels": 112896
+          },
+          {
+            "camera_index": 6,
+            "input_hw": [
+              1080,
+              1920
+            ],
+            "output_hw": [
+              84,
+              168
+            ],
+            "target_pixels": 16384,
+            "output_pixels": 14112
+          }
+        ],
+        "image_grid_thw": [
+          [
+            1,
+            20,
+            34
+          ],
+          [
+            1,
+            20,
+            34
+          ],
+          [
+            1,
+            18,
+            36
+          ],
+          [
+            1,
+            18,
+            36
+          ]
+        ],
+        "input_ids_shape": [
+          1,
+          777
+        ],
+        "runtime_profile": {
+          "vlm_generate_seconds": 0.4139765569999838,
+          "expert_step_calls": 6,
+          "expert_step_seconds": 0.26391943799998785,
+          "diffusion_seconds": 0.2646701689999986,
+          "generated_sequence_length": 777,
+          "prefill_seq_len": 777,
+          "total_seconds": 0.696519115000001
+        },
+        "sanity": {
+          "finite": true,
+          "within_bounds": true,
+          "accel_abs_max": 0.710431694984436,
+          "curvature_abs_max": 0.28200438618659973
+        }
+      },
+      {
+        "profile": "wide_112k_tele_16k",
+        "clip_id": "709fe679-4f3e-4938-8767-23886741c6bc",
+        "t0_relative": 11000000,
+        "seconds": 0.6938,
+        "image_tokens": 664,
+        "ade_m": 3.5335,
+        "longitudinal_mae_m": 1.237,
+        "lateral_mae_m": 3.1639,
+        "endpoint_longitudinal_abs_m": 3.855,
+        "endpoint_lateral_abs_m": 9.8653,
+        "resize_stats": [
+          {
+            "camera_index": 1,
+            "input_hw": [
+              1080,
+              1920
+            ],
+            "output_hw": [
+              252,
+              448
+            ],
+            "target_pixels": 114688,
+            "output_pixels": 112896
+          },
+          {
+            "camera_index": 6,
+            "input_hw": [
+              1080,
+              1920
+            ],
+            "output_hw": [
+              84,
+              168
+            ],
+            "target_pixels": 16384,
+            "output_pixels": 14112
+          }
+        ],
+        "image_grid_thw": [
+          [
+            1,
+            20,
+            34
+          ],
+          [
+            1,
+            20,
+            34
+          ],
+          [
+            1,
+            18,
+            36
+          ],
+          [
+            1,
+            18,
+            36
+          ]
+        ],
+        "input_ids_shape": [
+          1,
+          777
+        ],
+        "runtime_profile": {
+          "vlm_generate_seconds": 0.4120034700000019,
+          "expert_step_calls": 6,
+          "expert_step_seconds": 0.266301062000025,
+          "diffusion_seconds": 0.2671359070000108,
+          "generated_sequence_length": 777,
+          "prefill_seq_len": 777,
+          "total_seconds": 0.6936126779999938
+        },
+        "sanity": {
+          "finite": true,
+          "within_bounds": true,
+          "accel_abs_max": 1.7414231300354004,
+          "curvature_abs_max": 1.1253173351287842
+        }
+      },
+      {
+        "profile": "wide_112k_tele_16k",
+        "clip_id": "8455d8a6-3c18-473b-90fd-a89038684c6f",
+        "t0_relative": 10000000,
+        "seconds": 0.7032,
+        "image_tokens": 664,
+        "ade_m": 5.5098,
+        "longitudinal_mae_m": 1.9699,
+        "lateral_mae_m": 4.9789,
+        "endpoint_longitudinal_abs_m": 1.5349,
+        "endpoint_lateral_abs_m": 16.3902,
+        "resize_stats": [
+          {
+            "camera_index": 1,
+            "input_hw": [
+              1080,
+              1920
+            ],
+            "output_hw": [
+              252,
+              448
+            ],
+            "target_pixels": 114688,
+            "output_pixels": 112896
+          },
+          {
+            "camera_index": 6,
+            "input_hw": [
+              1080,
+              1920
+            ],
+            "output_hw": [
+              84,
+              168
+            ],
+            "target_pixels": 16384,
+            "output_pixels": 14112
+          }
+        ],
+        "image_grid_thw": [
+          [
+            1,
+            20,
+            34
+          ],
+          [
+            1,
+            20,
+            34
+          ],
+          [
+            1,
+            18,
+            36
+          ],
+          [
+            1,
+            18,
+            36
+          ]
+        ],
+        "input_ids_shape": [
+          1,
+          777
+        ],
+        "runtime_profile": {
+          "vlm_generate_seconds": 0.3946300830000382,
+          "expert_step_calls": 6,
+          "expert_step_seconds": 0.3034023000000161,
+          "diffusion_seconds": 0.30434200000001965,
+          "generated_sequence_length": 777,
+          "prefill_seq_len": 777,
+          "total_seconds": 0.7030608000000029
+        },
+        "sanity": {
+          "finite": true,
+          "within_bounds": true,
+          "accel_abs_max": 2.0488548278808594,
+          "curvature_abs_max": 2.682852268218994
+        }
+      }
+    ]
+  }
+}

@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
+import os
 import time
 from collections import deque
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -11,12 +13,12 @@ import cereal.messaging as messaging
 from cereal import car, log
 from msgq.visionipc import VisionIpcClient, VisionStreamType
 from openpilot.common.params import Params
-from openpilot.common.realtime import Priority, config_realtime_process
 from openpilot.common.swaglog import cloudlog
 from openpilot.common.transformations.camera import DEVICE_CAMERAS
 from openpilot.common.transformations.model import get_warp_matrix
 from openpilot.common.transformations.orientation import euler_from_rot, rot_from_euler
 from openpilot.selfdrive.alpamayo.protocol import (
+  FRAME_ENCODING_JPEG_BGR,
   PROTOCOL_VERSION,
   REQUEST_CONTENT_TYPE,
   RESPONSE_CONTENT_TYPE,
@@ -24,6 +26,7 @@ from openpilot.selfdrive.alpamayo.protocol import (
   decode_payload,
   encode_payload,
   parse_xyzt_dict,
+  serialize_jpeg_bgr_frame,
   serialize_nv12_frame,
   xyzt_to_dict,
 )
@@ -35,17 +38,18 @@ from openpilot.selfdrive.modeld.fill_model_msg import fill_xyzt
 SEMANTIC_PLAN_FREQ = 4
 PUBLISH_DECIMATION = max(1, ModelConstants.MODEL_RUN_FREQ // SEMANTIC_PLAN_FREQ)
 REMOTE_CONNECT_TIMEOUT_S = 0.15
-REMOTE_READ_TIMEOUT_S = 0.8
+REMOTE_READ_TIMEOUT_S = 2.0
 REMOTE_CACHE_MAX_AGE_S = 1.0
+REMOTE_INIT_RETRY_S = 5.0
 FRAME_SYNC_TOLERANCE_NS = int(0.05 * 1e9)
 FRAME_HISTORY_TOLERANCE_NS = int(0.065 * 1e9)
 FRAME_BUNDLE_STEP_NS = int(0.1 * 1e9)
 FRAME_BUNDLE_COUNT = 2
+REMOTE_TRANSPORT_PIXELS = 65536
+REMOTE_TRANSPORT_JPEG_QUALITY = 80
 POSE_HISTORY_DT_S = 0.1
 POSE_HISTORY_STEPS = 16
 POSE_EXTRAPOLATION_LIMIT_S = 0.15
-
-
 @dataclass
 class SemanticPlanData:
   t: np.ndarray
@@ -195,6 +199,114 @@ def _clamped_float(value: Any, default: float, lower: float = 0.0, upper: float 
   return float(np.clip(_safe_float(value, default), lower, upper))
 
 
+def _xyzt_first_component(builder: Any, default: float = 0.0) -> float:
+  try:
+    values = getattr(builder, "x")
+    if len(values):
+      return float(values[0])
+  except (AttributeError, IndexError, TypeError, ValueError):
+    pass
+  return default
+
+
+def _approx_vehicle_state(model_msg: Any) -> Any:
+  v_ego = _xyzt_first_component(getattr(model_msg, "velocity", None), 0.0)
+  a_ego = _xyzt_first_component(getattr(model_msg, "acceleration", None), 0.0)
+  return SimpleNamespace(
+    vEgo=v_ego,
+    aEgo=a_ego,
+    standstill=abs(v_ego) < 0.1,
+    steeringAngleDeg=0.0,
+    gasPressed=False,
+    brakePressed=False,
+  )
+
+
+def _approx_selfdrive_state() -> Any:
+  return SimpleNamespace(
+    enabled=False,
+    active=False,
+    experimentalMode=False,
+  )
+
+
+def _approx_driver_monitoring_state() -> Any:
+  return SimpleNamespace(
+    isRHD=False,
+  )
+
+
+def _fill_xyzt_safe(builder: Any, t: np.ndarray, x: np.ndarray, y: np.ndarray, z: np.ndarray) -> None:
+  # Cap'n Proto accepts plain Python lists for assignment, while fill_xyzt assumes numpy arrays for x/y/z.
+  builder.t = np.asarray(t, dtype=np.float32).tolist()
+  builder.x = np.asarray(x, dtype=np.float32).tolist()
+  builder.y = np.asarray(y, dtype=np.float32).tolist()
+  builder.z = np.asarray(z, dtype=np.float32).tolist()
+
+
+def _transport_frame_dims(width: int, height: int, max_pixels: int = REMOTE_TRANSPORT_PIXELS) -> tuple[int, int]:
+  aspect = float(width) / float(height)
+  target_width = int(round(np.sqrt(max_pixels * aspect)))
+  target_height = int(round(target_width / aspect))
+  target_width = max(64, target_width - (target_width % 2))
+  target_height = max(64, target_height - (target_height % 2))
+
+  while target_width * target_height > max_pixels:
+    if target_width >= target_height:
+      target_width -= 2
+    else:
+      target_height -= 2
+  return target_width, target_height
+
+
+def _encode_transport_frame(frame: CapturedFrame) -> dict[str, Any]:
+  import cv2
+
+  target_width, target_height = _transport_frame_dims(frame.width, frame.height)
+  expected_bytes = frame.stride * frame.height * 3 // 2
+  payload = frame.data[:expected_bytes]
+  if len(payload) < expected_bytes:
+    return serialize_nv12_frame(
+      frame.stream,
+      frame.data,
+      frame.width,
+      frame.height,
+      frame.stride,
+      frame.uv_offset,
+      frame.frame_id,
+      frame.timestamp_sof,
+      frame.timestamp_eof,
+    )
+
+  nv12 = np.frombuffer(payload, dtype=np.uint8).reshape((frame.height + frame.height // 2, frame.stride))
+  bgr = cv2.cvtColor(nv12[:, :frame.width], cv2.COLOR_YUV2BGR_NV12)
+  if (target_width, target_height) != (frame.width, frame.height):
+    bgr = cv2.resize(bgr, (target_width, target_height), interpolation=cv2.INTER_AREA)
+  ok, encoded = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), REMOTE_TRANSPORT_JPEG_QUALITY])
+  if not ok:
+    return serialize_nv12_frame(
+      frame.stream,
+      frame.data,
+      frame.width,
+      frame.height,
+      frame.stride,
+      frame.uv_offset,
+      frame.frame_id,
+      frame.timestamp_sof,
+      frame.timestamp_eof,
+    )
+
+  return serialize_jpeg_bgr_frame(
+    frame.stream,
+    encoded.tobytes(),
+    target_width,
+    target_height,
+    frame.frame_id,
+    frame.timestamp_sof,
+    frame.timestamp_eof,
+  )
+
+
 def _camera_context(ctx: ProviderContext) -> dict[str, Any]:
   sensor = _enum_name(getattr(ctx.road_camera_state, "sensor", "unknown"))
   device_type = _enum_name(getattr(ctx.device_state, "deviceType", "unknown"))
@@ -284,11 +396,12 @@ class PoseHistoryBuffer:
     if len(getattr(live_calibration, "rpyCalib", [])) == 3:
       self.calibrator.feed_live_calib(live_calibration)
 
-  def feed(self, live_pose) -> None:
+  def feed(self, live_pose, timestamp_ns: int | None = None) -> None:
     if not (self._measurement_valid(live_pose, "orientationNED") and self._measurement_valid(live_pose, "velocityDevice")):
       return
 
-    timestamp_ns = int(getattr(live_pose, "timestamp", 0))
+    if timestamp_ns is None:
+      timestamp_ns = int(getattr(live_pose, "timestamp", 0))
     if timestamp_ns <= 0:
       return
 
@@ -468,20 +581,7 @@ class RemoteServerProvider:
     if len(ordered_frames) != len(VisionStreamManager.REQUIRED_STREAMS) * FRAME_BUNDLE_COUNT:
       return None
 
-    frame_payloads = [
-      serialize_nv12_frame(
-        frame.stream,
-        frame.data,
-        frame.width,
-        frame.height,
-        frame.stride,
-        frame.uv_offset,
-        frame.frame_id,
-        frame.timestamp_sof,
-        frame.timestamp_eof,
-      )
-      for frame in ordered_frames
-    ]
+    frame_payloads = [_encode_transport_frame(frame) for frame in ordered_frames]
 
     latest_road = ctx.frame_bundle["road"][-1]
     latest_wide = ctx.frame_bundle["wideRoad"][-1]
@@ -509,8 +609,8 @@ class RemoteServerProvider:
       "runtimeConfig": {
         "cameraMode": "front2",
         "numFrames": FRAME_BUNDLE_COUNT,
-        "minPixels": 65536,
-        "maxPixels": 65536,
+        "minPixels": REMOTE_TRANSPORT_PIXELS,
+        "maxPixels": REMOTE_TRANSPORT_PIXELS,
         "reasoningMode": "prefill_future_start",
         "diffusionSteps": 6,
         "numTrajSamples": 1,
@@ -518,6 +618,8 @@ class RemoteServerProvider:
         "splitIndex": 16,
         "attnImplementation": "flash_attention_2",
         "expertAttnImplementation": "eager",
+        "transportEncoding": FRAME_ENCODING_JPEG_BGR,
+        "transportJpegQuality": REMOTE_TRANSPORT_JPEG_QUALITY,
       },
       "vehicleState": {
         "vEgo": float(getattr(ctx.car_state, "vEgo", 0.0)),
@@ -645,7 +747,11 @@ class RemoteServerProvider:
 
 
 def main():
-  config_realtime_process(5, Priority.CTRL_LOW)
+  # This sidecar must never compete with the stock control/model daemons for realtime scheduling.
+  try:
+    os.nice(10)
+  except OSError:
+    pass
   params = Params()
 
   cloudlog.info("alpamayod is waiting for CarParams")
@@ -657,14 +763,14 @@ def main():
     endpoint = endpoint_value.decode("utf-8")
   else:
     endpoint = endpoint_value or None
-  remote_provider = endpoint is not None and len(endpoint) > 0
-  provider = RemoteServerProvider(endpoint) if remote_provider else StockMirrorProvider()
-  vision_streams = VisionStreamManager() if remote_provider else None
+  remote_enabled = endpoint is not None and len(endpoint) > 0
+  remote_provider: RemoteServerProvider | None = None
+  vision_streams: VisionStreamManager | None = None
+  next_remote_init_attempt = 0.0
   pose_history = PoseHistoryBuffer()
 
   sm = messaging.SubMaster(
-    ['modelV2', 'carState', 'selfdriveState', 'navInstruction', 'deviceState', 'roadCameraState',
-     'liveCalibration', 'driverMonitoringState', 'livePose'],
+    ['modelV2', 'navInstruction', 'deviceState', 'roadCameraState', 'liveCalibration', 'livePose'],
     poll='modelV2',
     ignore_alive=['navInstruction'],
     ignore_avg_freq=['navInstruction'],
@@ -674,91 +780,133 @@ def main():
   consecutive_valid = 0
   publish_count = 0
 
-  cloudlog.info("alpamayod using %s provider", provider.name)
+  cloudlog.info("alpamayod booted with remote_enabled=%s", remote_enabled)
 
   while True:
-    sm.update()
-    if sm.updated['liveCalibration']:
-      pose_history.update_calibration(sm['liveCalibration'])
-    if sm.updated['livePose']:
-      pose_history.feed(sm['livePose'])
+    try:
+      sm.update()
+      now = time.monotonic()
 
-    if not sm.updated['modelV2']:
-      continue
+      if sm.updated['liveCalibration']:
+        pose_history.update_calibration(sm['liveCalibration'])
+      if sm.updated['livePose']:
+        pose_history.feed(sm['livePose'], int(sm.logMonoTime['livePose']))
 
-    publish_count += 1
-    if publish_count % PUBLISH_DECIMATION != 0:
-      continue
+      # Match the working manual probe: keep VisionIPC history warm continuously,
+      # not only on the decimated semantic publish ticks.
+      if vision_streams is not None:
+        vision_streams.poll()
 
-    plan_send = messaging.new_message('semanticPlan')
-    frame_bundle = vision_streams.get_frame_bundle() if vision_streams is not None else {}
-    frame_t0_s = None
-    ego_history_xyz = ego_history_rot = None
-    if frame_bundle:
-      frame_t0_ns = min(frame_bundle[name][-1].timestamp_eof for name in VisionStreamManager.REQUIRED_STREAMS)
-      frame_t0_s = frame_t0_ns * 1e-9
-      history = pose_history.build(frame_t0_s)
-      if history is not None:
-        ego_history_xyz, ego_history_rot = history
+      if not sm.updated['modelV2']:
+        continue
 
-    nav_instruction = sm['navInstruction'] if sm.seen['navInstruction'] else None
-    ctx = ProviderContext(
-      model_msg=sm['modelV2'],
-      model_mono_time=sm.logMonoTime['modelV2'],
-      car_state=sm['carState'],
-      selfdrive_state=sm['selfdriveState'],
-      nav_instruction=nav_instruction,
-      device_state=sm['deviceState'],
-      road_camera_state=sm['roadCameraState'],
-      live_calibration=sm['liveCalibration'],
-      driver_monitoring_state=sm['driverMonitoringState'],
-      frame_bundle=frame_bundle,
-      ego_history_xyz=ego_history_xyz,
-      ego_history_rot=ego_history_rot,
-      frame_t0_s=frame_t0_s,
-    )
+      publish_count += 1
+      if publish_count % PUBLISH_DECIMATION != 0:
+        continue
 
-    generation_start = time.monotonic()
-    semantic_plan = provider.build(ctx)
-    generation_time = time.monotonic() - generation_start
-
-    plan_send.valid = sm.all_checks(['modelV2', 'carState', 'selfdriveState', 'deviceState', 'roadCameraState',
-                                     'driverMonitoringState', 'livePose'])
-    sp = plan_send.semanticPlan
-    if semantic_plan is None:
-      consecutive_valid = 0
+      plan_send = messaging.new_message('semanticPlan')
+      plan_send.valid = sm.seen['modelV2'] and sm.valid['modelV2']
+      sp = plan_send.semanticPlan
+      sp.frameId = sm['modelV2'].frameId
+      sp.frameIdExtra = sm['modelV2'].frameIdExtra
+      sp.timestampEof = sm['modelV2'].timestampEof
+      sp.modelMonoTime = sm.logMonoTime['modelV2']
+      sp.source = log.SemanticPlan.Source.none
       sp.status = log.SemanticPlan.Status.unavailable
+
+      if remote_enabled and remote_provider is None and now >= next_remote_init_attempt:
+        try:
+          remote_provider = RemoteServerProvider(endpoint)
+          vision_streams = VisionStreamManager()
+          cloudlog.info("alpamayod remote provider initialized")
+        except Exception:
+          remote_provider = None
+          vision_streams = None
+          next_remote_init_attempt = now + REMOTE_INIT_RETRY_S
+          cloudlog.exception("alpamayod remote path init failed; staying stock-mirror until retry")
+
+      use_remote = remote_provider is not None and vision_streams is not None
+      frame_bundle = vision_streams.get_frame_bundle() if use_remote else {}
+      frame_t0_s = None
+      ego_history_xyz = ego_history_rot = None
+      if frame_bundle:
+        frame_t0_ns = min(frame_bundle[name][-1].timestamp_eof for name in VisionStreamManager.REQUIRED_STREAMS)
+        frame_t0_s = frame_t0_ns * 1e-9
+        history = pose_history.build(frame_t0_s)
+        if history is not None:
+          ego_history_xyz, ego_history_rot = history
+
+      nav_instruction = sm['navInstruction'] if sm.seen['navInstruction'] else None
+      ctx = ProviderContext(
+        model_msg=sm['modelV2'],
+        model_mono_time=sm.logMonoTime['modelV2'],
+        car_state=_approx_vehicle_state(sm['modelV2']),
+        selfdrive_state=_approx_selfdrive_state(),
+        nav_instruction=nav_instruction,
+        device_state=sm['deviceState'],
+        road_camera_state=sm['roadCameraState'],
+        live_calibration=sm['liveCalibration'],
+        driver_monitoring_state=_approx_driver_monitoring_state(),
+        frame_bundle=frame_bundle,
+        ego_history_xyz=ego_history_xyz,
+        ego_history_rot=ego_history_rot,
+        frame_t0_s=frame_t0_s,
+      )
+
+      generation_start = time.monotonic()
+      semantic_plan = None
+      if use_remote and ego_history_xyz is not None and ego_history_rot is not None:
+        semantic_plan = remote_provider.build(ctx)
+      generation_time = time.monotonic() - generation_start
+
+      if semantic_plan is None:
+        consecutive_valid = 0
+        sp.generationExecutionTime = float(generation_time)
+        sp.age = 0.0
+        sp.confidence = 0.0
+        sp.consistency = 0.0
+        sp.consecutiveValid = 0
+        sp.navInstructionPresent = nav_instruction is not None
+        sp.blendHint = 0.0
+        pm.send('semanticPlan', plan_send)
+        continue
+
+      if semantic_plan.status == log.SemanticPlan.Status.valid:
+        consecutive_valid = min(consecutive_valid + 1, 255)
+      else:
+        consecutive_valid = 0
+
+      sp.generationExecutionTime = float(generation_time)
+      sp.age = float(semantic_plan.age)
+      sp.confidence = semantic_plan.confidence
+      sp.consistency = semantic_plan.consistency
+      sp.desiredCurvature = semantic_plan.desired_curvature
+      sp.desiredAcceleration = semantic_plan.desired_acceleration
+      sp.shouldStop = semantic_plan.should_stop
+      sp.source = semantic_plan.source
+      sp.status = semantic_plan.status
+      sp.consecutiveValid = consecutive_valid
+      sp.navInstructionPresent = nav_instruction is not None
+      sp.blendHint = semantic_plan.blend_hint
+
+      _fill_xyzt_safe(sp.position, semantic_plan.t, *semantic_plan.position.T)
+      _fill_xyzt_safe(sp.orientation, semantic_plan.t, *semantic_plan.orientation.T)
+      _fill_xyzt_safe(sp.velocity, semantic_plan.t, *semantic_plan.velocity.T)
+      _fill_xyzt_safe(sp.orientationRate, semantic_plan.t, *semantic_plan.orientation_rate.T)
+      _fill_xyzt_safe(sp.acceleration, semantic_plan.t, *semantic_plan.acceleration.T)
       pm.send('semanticPlan', plan_send)
-      continue
-
-    if semantic_plan.status == log.SemanticPlan.Status.valid:
-      consecutive_valid = min(consecutive_valid + 1, 255)
-    else:
+    except Exception:
+      cloudlog.exception("alpamayod iteration failed; publishing unavailable semantic plan")
       consecutive_valid = 0
-
-    sp.frameId = sm['modelV2'].frameId
-    sp.frameIdExtra = sm['modelV2'].frameIdExtra
-    sp.timestampEof = sm['modelV2'].timestampEof
-    sp.modelMonoTime = sm.logMonoTime['modelV2']
-    sp.generationExecutionTime = float(generation_time)
-    sp.age = float(semantic_plan.age)
-    sp.confidence = semantic_plan.confidence
-    sp.consistency = semantic_plan.consistency
-    sp.desiredCurvature = semantic_plan.desired_curvature
-    sp.desiredAcceleration = semantic_plan.desired_acceleration
-    sp.shouldStop = semantic_plan.should_stop
-    sp.source = semantic_plan.source
-    sp.status = semantic_plan.status
-    sp.consecutiveValid = consecutive_valid
-    sp.navInstructionPresent = nav_instruction is not None
-    sp.blendHint = semantic_plan.blend_hint
-
-    fill_xyzt(sp.position, semantic_plan.t, *semantic_plan.position.T)
-    fill_xyzt(sp.orientation, semantic_plan.t, *semantic_plan.orientation.T)
-    fill_xyzt(sp.velocity, semantic_plan.t, *semantic_plan.velocity.T)
-    fill_xyzt(sp.orientationRate, semantic_plan.t, *semantic_plan.orientation_rate.T)
-    fill_xyzt(sp.acceleration, semantic_plan.t, *semantic_plan.acceleration.T)
-    pm.send('semanticPlan', plan_send)
+      fallback_send = messaging.new_message('semanticPlan')
+      if sm.seen['modelV2']:
+        fallback_send.semanticPlan.frameId = sm['modelV2'].frameId
+        fallback_send.semanticPlan.frameIdExtra = sm['modelV2'].frameIdExtra
+        fallback_send.semanticPlan.timestampEof = sm['modelV2'].timestampEof
+        fallback_send.semanticPlan.modelMonoTime = sm.logMonoTime['modelV2']
+      fallback_send.semanticPlan.source = log.SemanticPlan.Source.none
+      fallback_send.semanticPlan.status = log.SemanticPlan.Status.unavailable
+      pm.send('semanticPlan', fallback_send)
 
 
 if __name__ == "__main__":
