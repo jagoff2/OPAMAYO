@@ -13,6 +13,195 @@ This document records:
 
 This is a runtime proof and operator runbook, not a design note.
 
+## Addendum: PC Server Repo Completeness, Environment Rebuild, And Fast-Path Replication
+
+This repo contains the **source code** needed to launch the PC Alpamayo server:
+
+- `selfdrive/alpamayo/server.py`
+- `selfdrive/alpamayo/protocol.py`
+- `selfdrive/alpamayo/alpamayod.py`
+- the c3x integration files under `cereal/`, `common/`, `system/`, `selfdrive/modeld/`, and `sunnypilot/modeld*`
+- the vendored Alpamayo source tree under `alpamayo1.5/`
+- the benchmark, comparison, and run scripts used during bring-up
+
+This repo does **not** contain:
+
+- the live rebuilt Linux virtualenv
+- Hugging Face auth state
+- the gated Alpamayo and Cosmos model weights/cache
+
+The reason the venv is not stored in git is simple: the working Linux venv is about **8.1 GiB** and mostly consists of compiled CUDA, Torch, FlashAttention, and NVIDIA shared libraries. That is not a sane git artifact.
+
+### Exact Working Environment That Was Used
+
+The server and benchmarking path were validated in WSL/Linux with:
+
+- Python `3.12.3`
+- `uv 0.9.16`
+- `nvcc 12.0.140`
+- `torch 2.8.0`
+- `flash_attn 2.8.3`
+- `transformers 4.57.1`
+- `accelerate 1.12.0`
+- `physical_ai_av 0.2.0`
+- `opencv-python-headless 4.13.0.92`
+- `zstandard 0.25.0`
+
+The exact pip environment used to run this is captured in:
+
+- `alpamayo1.5/requirements.txt`
+
+### Rebuild The Venv From Scratch
+
+Assumptions:
+
+- Linux or WSL with NVIDIA GPU access already working
+- `nvcc` available on PATH
+- Python 3.12 available
+- enough disk for a multi-gigabyte env and model cache
+
+Concrete procedure:
+
+```bash
+# 1. Enter the vendored Alpamayo source tree
+cd /path/to/OPAMAYO/alpamayo1.5
+
+# 2. Install uv if needed
+curl -LsSf https://astral.sh/uv/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"
+
+# 3. Create and activate the environment
+uv venv a1_5_venv --python 3.12
+source a1_5_venv/bin/activate
+
+# 4. Install the exact package set used during bring-up
+python -m pip install -r requirements.txt
+
+# 5. Authenticate for the gated model + dataset
+hf auth login
+
+# 6. Optional but recommended cache location
+export HF_HOME=/path/to/hf-cache
+
+# 7. Sanity-check the critical runtime pieces
+python -c 'import torch, flash_attn, cv2, zstandard; print(torch.__version__)'
+python -m py_compile timed_inference.py src/alpamayo1_5/models/alpamayo1_5.py src/alpamayo1_5/models/base_model.py
+```
+
+Important notes:
+
+- `flash-attn` is part of the proven fast path. Do not skip it if the goal is to reproduce the measured sub-1-second warm semantic loop.
+- `opencv-python-headless` and `zstandard` are required for the openpilot-side server transport path.
+- The model weights are **not** installed by git. They are pulled by Hugging Face on first use after auth succeeds.
+
+### Launch The PC Server From This Repo
+
+From the OPAMAYO repo root:
+
+```bash
+cd /path/to/OPAMAYO
+source alpamayo1.5/a1_5_venv/bin/activate
+export PYTHONPATH=$PWD
+export HF_HOME=/path/to/hf-cache
+
+python -m selfdrive.alpamayo.server \
+  --host 0.0.0.0 \
+  --port 8081 \
+  --source remoteServer \
+  --gpu-mem-gib 15 \
+  --cpu-mem-gib 96 \
+  --split-index 16 \
+  --min-pixels 65536 \
+  --max-pixels 65536 \
+  --diffusion-steps 6 \
+  --num-traj-samples 1 \
+  --attn-implementation flash_attention_2 \
+  --expert-attn-implementation eager \
+  --reasoning-mode prefill_future_start
+```
+
+Operational detail:
+
+- `PYTHONPATH=$PWD` matters.
+- `python -m selfdrive.alpamayo.server ...` is the safe invocation.
+- Invoking `python selfdrive/alpamayo/server.py ...` directly without the repo root on `PYTHONPATH` can fail on `ModuleNotFoundError: selfdrive`.
+
+### How The Fast Alpamayo Path Was Made
+
+The fast path was not a generic quantization trick. It was a specific runtime simplification and execution-layout change.
+
+Mechanically, the fast path consists of:
+
+1. **Skip runtime CoT token generation**
+   - Instead of waiting for the model to autoregressively emit reasoning text and then `<|traj_future_start|>`, the prompt is rewritten so the assistant prefill starts directly at `<|traj_future_start|>`.
+   - In the repo this is implemented by the `prefill_future_start` path in:
+     - `alpamayo1.5/timed_inference.py`
+     - `selfdrive/alpamayo/server.py`
+   - And by using `skip_vlm_generation=True` when calling `sample_trajectories_from_data_with_vlm_rollout(...)` in:
+     - `alpamayo1.5/src/alpamayo1_5/models/alpamayo1_5.py`
+
+2. **Use a manual 2-GPU layer split**
+   - The VLM/expert stack is split across 2 GPUs at `split_index=16`.
+   - The helper for this is `build_manual_split_device_map(...)` in:
+     - `alpamayo1.5/timed_inference.py`
+     - `selfdrive/alpamayo/server.py`
+
+3. **Use mixed attention backends**
+   - VLM attention: `flash_attention_2`
+   - expert attention: `eager`
+   - The attention-plumbing modifications live in:
+     - `alpamayo1.5/src/alpamayo1_5/models/base_model.py`
+     - `alpamayo1.5/src/alpamayo1_5/models/alpamayo1_5.py`
+
+4. **Reduce visual/context load without dropping the 2-camera sidecar design**
+   - cameras: `front2`
+   - frames: `2`
+   - pixel budget: `65536` min/max
+   - trajectory samples: `1`
+   - diffusion steps: `6`
+
+5. **Keep the output semantic**
+   - The fast path still produces a full future trajectory prior.
+   - It does not emit runtime chain-of-thought text on the critical path.
+
+### Reproduce The Fast Benchmark
+
+From `alpamayo1.5/`:
+
+```bash
+cd /path/to/OPAMAYO/alpamayo1.5
+source a1_5_venv/bin/activate
+export HF_HOME=/path/to/hf-cache
+
+python timed_inference.py \
+  --camera-mode front2 \
+  --num-frames 2 \
+  --gpu-mem-gib 15 \
+  --cpu-mem-gib 96 \
+  --min-pixels 65536 \
+  --max-pixels 65536 \
+  --device-map-mode manual_split \
+  --split-index 16 \
+  --repeat-infer 3 \
+  --num-traj-samples 1 \
+  --diffusion-steps 6 \
+  --attn-implementation flash_attention_2 \
+  --expert-attn-implementation eager \
+  --reasoning-mode prefill_future_start
+```
+
+The measured successful warm-loop profile from this repo was approximately:
+
+- first post-load iteration: `~1.52 s`
+- warm iteration 1: `~0.65 s`
+- warm iteration 2: `~0.66 s`
+
+Those numbers are recorded in:
+
+- `alpamayo1.5/timed_inference_prefill_future_start_flash_vlm_eager_expert_front2_2f_64k_split16_diff6_repeat3.log`
+
+That is the configuration the PC server defaults were aligned with.
+
 ## System Mechanics In Plain English
 
 The system is a two-rate planner:
