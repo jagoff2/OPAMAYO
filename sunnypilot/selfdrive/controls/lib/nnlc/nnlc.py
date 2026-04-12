@@ -17,6 +17,7 @@ from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.sunnypilot.selfdrive.controls.lib.latcontrol_torque_ext_base import LatControlTorqueExtBase, sign
 from openpilot.sunnypilot.selfdrive.controls.lib.nnlc.helpers import MOCK_MODEL_PATH
 from openpilot.sunnypilot.selfdrive.controls.lib.nnlc.model import NNTorqueModel
+from openpilot.sunnypilot.selfdrive.controls.lib.nnlc.sigmoid_map_tuner import SigmoidMapTuner
 
 LOW_SPEED_X = [0, 10, 20, 30]
 LOW_SPEED_Y = [12, 3, 1, 0]
@@ -58,6 +59,11 @@ class NeuralNetworkLateralControl(LatControlTorqueExtBase):
     self.roll_deque = deque(maxlen=history_check_frames[0])
     self.error_deque = deque(maxlen=history_check_frames[0])
     self.past_future_len = len(self.past_times) + len(self.nn_future_times)
+
+    self.sigmoid_map_tuner = SigmoidMapTuner(lac_torque,
+                                             self.torque_params,
+                                             self.torque_from_lateral_accel_in_torque_space,
+                                             CP.carFingerprint)
 
   @property
   def _nnlc_enabled(self):
@@ -162,3 +168,11 @@ class NeuralNetworkLateralControl(LatControlTorqueExtBase):
       self._pid_log.error += get_friction(friction_input, self._lateral_accel_deadzone, FRICTION_THRESHOLD, self.torque_params)
 
     self.update_output_torque(CS)
+    self.sigmoid_map_tuner.observe(self._nnlc_enabled,
+                                   CS,
+                                   self._setpoint,
+                                   self._measurement,
+                                   self._desired_lateral_accel,
+                                   self._output_torque,
+                                   self._steer_limited_by_safety,
+                                   self._roll_compensation)
