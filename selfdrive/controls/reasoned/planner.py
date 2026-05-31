@@ -57,6 +57,14 @@ class ReasonedStepResult:
   vlm_backend: str
   rtp_source_frame_id: int | None
   rtp_age_frames: int | None
+  labels: tuple[str, ...]
+  label_scores: dict[str, float]
+  raw_labels: tuple[str, ...]
+  raw_label_scores: dict[str, float]
+  labels_scored_this_request: tuple[str, ...]
+  score_group_index: int | None
+  label_state_debug: dict | None
+  choice: dict | None
   timings: ReasonedTimings
   program: Optional[RtpProgram]
   synth: Optional[PathSynthResult]
@@ -152,6 +160,14 @@ class ReasonedPlanner:
       vlm_backend=rtp_result.backend if rtp_result is not None else getattr(self.engine, "backend", "unknown"),
       rtp_source_frame_id=rtp_source_frame_id,
       rtp_age_frames=rtp_age_frames,
+      labels=rtp_result.labels if rtp_result is not None else (),
+      label_scores=rtp_result.label_scores if rtp_result is not None and rtp_result.label_scores is not None else {},
+      raw_labels=rtp_result.raw_labels if rtp_result is not None else (),
+      raw_label_scores=rtp_result.raw_label_scores if rtp_result is not None and rtp_result.raw_label_scores is not None else {},
+      labels_scored_this_request=rtp_result.labels_scored_this_request if rtp_result is not None else (),
+      score_group_index=rtp_result.score_group_index if rtp_result is not None else None,
+      label_state_debug=rtp_result.label_state_debug if rtp_result is not None else None,
+      choice=rtp_result.choice if rtp_result is not None else None,
       timings=timings,
       program=program,
       synth=synth,

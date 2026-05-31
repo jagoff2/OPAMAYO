@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from io import BytesIO
 import os
 from pathlib import Path
@@ -21,6 +21,7 @@ class SceneBoard:
   height: int
   pixels: bytearray
   state_text: str
+  aux_pngs: dict[str, bytes] = field(default_factory=dict)
 
   def set_px(self, x: int, y: int, color: Color) -> None:
     if 0 <= x < self.width and 0 <= y < self.height:
@@ -92,6 +93,7 @@ class SceneBoardRenderer:
     state_text = (
       f"frame={base_plan.frame_id} "
       f"v_ego={base_plan.current_speed:.1f}mps "
+      f"desired speed {base_plan.desired_speed:.1f} m/s "
       f"curv={base_plan.desired_curvature:.5f} "
       f"blinkers={int(state.get('left_blinker', 0))}/{int(state.get('right_blinker', 0))}"
     )

@@ -73,26 +73,30 @@ def validate_video(path: Path) -> dict[str, float | int]:
 
 def render_videos(run_dir: Path, prefix: str, fps: float) -> list[Path]:
   stock_dir = run_dir / "stock"
-  vlm_dir = run_dir / "vlm"
+  reasoned_dir = run_dir / "vlm"
+  reasoned_label = "VLM"
+  if not reasoned_dir.exists():
+    reasoned_dir = run_dir / "static"
+    reasoned_label = "RTP"
   stock_frames = sorted(stock_dir.glob("stock_overlay_*.png"))
-  vlm_frames = sorted(vlm_dir.glob("vlm_input_*.png"))
+  reasoned_frames = sorted(reasoned_dir.glob("vlm_input_*.png"))
   if not stock_frames:
     raise RuntimeError(f"no stock frames found under {stock_dir}")
-  if not vlm_frames:
-    raise RuntimeError(f"no VLM frames found under {vlm_dir}")
+  if not reasoned_frames:
+    raise RuntimeError(f"no reasoned frames found under {reasoned_dir}")
 
   video_dir = run_dir / "videos"
   video_dir.mkdir(parents=True, exist_ok=True)
 
   stock_video = video_dir / f"stock_{prefix}.mp4"
   stock_padded_video = video_dir / f"stock_{prefix}_padded.mp4"
-  vlm_video = video_dir / f"vlm_{prefix}.mp4"
+  vlm_video = video_dir / f"{reasoned_label.lower()}_{prefix}.mp4"
   side_by_side_video = video_dir / f"side_by_side_{prefix}.mp4"
 
   write_video(stock_frames, stock_video, fps)
-  write_video(vlm_frames, vlm_video, fps)
+  write_video(reasoned_frames, vlm_video, fps)
 
-  first_vlm = read_frame(vlm_frames[0])
+  first_vlm = read_frame(reasoned_frames[0])
   height, width = first_vlm.shape[:2]
   stock_by_id = {frame_id(path): path for path in stock_frames}
   stock_ids = sorted(stock_by_id)
@@ -103,7 +107,7 @@ def render_videos(run_dir: Path, prefix: str, fps: float) -> list[Path]:
   if not writer.isOpened():
     raise RuntimeError(f"failed to open video writer: {stock_padded_video}")
   try:
-    for vlm_frame in vlm_frames:
+    for vlm_frame in reasoned_frames:
       stock_frame = nearest_stock_frame(stock_by_id, stock_ids, frame_id(vlm_frame))
       image = read_frame(stock_frame)
       if image.shape[:2] != (height, width):
@@ -118,7 +122,7 @@ def render_videos(run_dir: Path, prefix: str, fps: float) -> list[Path]:
   if not writer.isOpened():
     raise RuntimeError(f"failed to open video writer: {side_by_side_video}")
   try:
-    for vlm_frame in vlm_frames:
+    for vlm_frame in reasoned_frames:
       vlm_id = frame_id(vlm_frame)
       stock_frame = nearest_stock_frame(stock_by_id, stock_ids, vlm_id)
       left = read_frame(stock_frame)
@@ -131,7 +135,7 @@ def render_videos(run_dir: Path, prefix: str, fps: float) -> list[Path]:
         left = draw_label(left, f"STOCK ended at frame {last_stock_id}")
       else:
         left = draw_label(left, "STOCK")
-      right = draw_label(right, "VLM")
+      right = draw_label(right, reasoned_label)
       writer.write(np.hstack([left, right]))
   finally:
     writer.release()

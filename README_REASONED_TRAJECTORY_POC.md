@@ -28,11 +28,13 @@ Working:
 - Strict `RTPv1` parser with bounded fields and grammar validation.
 - Deterministic PathSynth compiler for lateral bias, avoid zones, speed
   modifiers, stop/yield constraints, and candidate selection.
-- TensorRT Qwen2.5-VL-3B fast label scorer:
+- TensorRT Qwen2.5-VL-3B fast label scorers:
   - fixed full-frame `168 px` scene-board input,
-  - FP16 TensorRT vision tower,
-  - NVFP4 TensorRT text/label scorer,
-  - fixed `text_seq_len=220`,
+  - verified FP32-build TensorRT vision tower, with FP16 output features,
+  - current red/green signal scoring through Qwen choice-mode text labels,
+    not a trained signal head,
+  - legacy NVFP4 TensorRT text/label scorer retained for construction,
+    pedestrian, and vehicle labels,
   - strict runtime manifest for prompt, labels, thresholds, image mode, image
     size, model config, and engine shapes.
 - Synchronous MetaDrive loop that publishes same-frame VLM plans at 20 Hz with
@@ -51,6 +53,9 @@ Known limitations:
 - The realtime path is no longer open-ended Qwen image-to-text generation. It
   uses Qwen as a constrained visual label scorer, then deterministically
   compiles labels into RTP fields.
+- Red/green traffic-light handling is back on the Qwen label path via
+  choice-mode answer-token scoring. The earlier trained visual-head experiment
+  is retained only as a diagnostic artifact and is not the production default.
 - The fast runtime is shape-bound by design. Changing prompt text, label groups,
   thresholds, image size, model files, or selected engine shapes requires a
   matching manifest and may require rebuilding TensorRT engines.
@@ -63,10 +68,35 @@ Known limitations:
   disabled in that mode.
 - The current fast Qwen backend is CUDA/TensorRT/NVIDIA. It is not yet a
   tinygrad AMD eGPU backend.
+- The red/green Qwen choice-mode path is verified under the 50 ms frame budget. The
+  broader production goal still requires bringing the remaining construction,
+  pedestrian, vehicle, and other labels onto an equally robust under-50 ms path.
 - Model weights, TensorRT engines, and run artifacts are intentionally ignored
   by git. They must be downloaded, built, or copied locally.
 - The MetaDrive demo proves control influence and closed-loop behavior in sim.
   It does not prove real-world safety.
+
+Production translation constraints:
+
+- The simulator is only a closed-loop harness. A sim video is accepted only when
+  the same Qwen label path, RTP compiler, stale-frame policy, and bounds would
+  also run on camera-derived scene boards in the car.
+- No synthetic pixel fallback is allowed in the production path. The
+  `--enable-visual-*fallback` switches are demo-only isolators for renderer and
+  controller bugs.
+- No trained shortcut head is the default production signal path. Label
+  decisions must remain auditable as Qwen prompt/input/choice-score records
+  unless a later replacement is explicitly validated as a new perception model.
+- Every published plan must carry `frame_id`, `rtp_source_frame_id`,
+  `rtp_age_frames`, labels, label scores, choice metadata, RTP text, and
+  compiler output so a road log can prove what perception judgement changed the
+  path.
+- Steering authority comes only from construction-side labels and deterministic
+  avoid-zone compilation. Pedestrians, vehicles, animals, stop signs, and
+  traffic lights may slow or stop in lane, but must not create a lateral swerve.
+- The current repo is not road-ready until the non-sim evaluations pass on real
+  road video/log replay for construction, pedestrians, lead vehicles, cut-ins,
+  stop signs, stoplights, occlusion, and mixed scenes.
 
 ## Architecture
 
@@ -145,9 +175,12 @@ Core runtime:
 - `selfdrive/controls/reasoned/ui_scene_board.py`
   - Full-frame, driver-UI-style scene board used by the VLM.
   - Includes camera frame, path overlay, HUD state, and visual affordances.
-  - The green planned corridor is intentionally widened by 25% versus the
-    previous POC overlay (`0.48 m` to `0.60 m` half-width) so Qwen evaluates a
-    vehicle-width corridor rather than a narrow center ribbon.
+  - The green planned corridor now uses a `0.90 m` half-width so Qwen evaluates
+    the approximate ego vehicle envelope/risk corridor rather than a narrow
+    center ribbon.
+  - The magenta base-path reference is opt-in. The default VLM board shows the
+    actual tracked green path without an extra synthetic line that can be
+    mistaken for construction or lane geometry.
 
 - `selfdrive/controls/reasoned_plannerd.py`
   - PC-only process that consumes `modelV2` and `carState`, runs the reasoned
@@ -195,6 +228,14 @@ POC tools:
   - Closed-loop MetaDrive demo runner.
   - Runs stock and VLM episodes.
   - Spawns random mixed construction and pedestrian scenes.
+  - Converts MetaDrive camera frames from BGR to RGB before scene-board
+    rendering. Without this, construction cones render blue and Qwen treats them
+    like road/runway markers rather than realistic orange/white traffic-control
+    devices.
+  - Uses `DefaultVehicle` with visual heading equal to route heading for
+    route-vehicle scenes. The saved lead-track state remains physical
+    distance/lateral/speed data; simulator `expected_lead_class` is only an
+    evaluation label.
   - Applies durable lateral and speed plans.
   - Tracks collisions, latency, RTP age, path deltas, speed deltas, and saved
     input frames.
@@ -293,13 +334,21 @@ The current path fixes this by:
 - Scoring `construction_left` and `construction_right` relative to the green
   planned path.
 - Emitting side-specific RTP:
-  - Right-side construction -> `BIAS_LEFT_AND_SLOW`, positive openpilot
+  - Right-side construction -> `BIAS_LEFT`, positive openpilot
     `lat_bias_m`, `right_edge...`
-  - Left-side construction -> `BIAS_RIGHT_AND_SLOW`, negative openpilot
+  - Left-side construction -> `BIAS_RIGHT`, negative openpilot
     `lat_bias_m`, `left_edge...`
 - Converting openpilot lateral sign at the MetaDrive boundary.
+- Converting the active MetaDrive controller offset back to openpilot sign before
+  rendering the green scene-board path, so Qwen sees the same path the controller
+  is actually tracking.
 - Clearing active durable lateral plans that pull the opposite direction when a
   new signed plan arrives with sufficient confidence.
+- Clearing stale corridor-object speed caps when the current VLM program no
+  longer contains a pedestrian/vehicle/animal/path-conflict judgement.
+- Ignoring new red-light stop plans once the car is already past the configured
+  traffic-light stop line, and using `traffic_light_full_stop_m` as the actual
+  stop-and-wait zone.
 
 This is not a "cones always mean left" shortcut. The VLM has to identify the
 construction side relative to the path, and the compiler/sign conversion then
@@ -326,20 +375,36 @@ GPU used for current fast path: RTX 5060 Ti 16 GB, compute capability 12.0
 Current external TensorRT artifacts:
 
 ```text
-F:\qwen_trt_export\nvfp4_trt\qwen_text_36layer_nvfp4_trt.engine
-F:\qwen_trt_export\nvfp4_trt\qwen_text_36layer_nvfp4_trt.onnx
-F:\qwen_trt_export\vision_static_fp16\qwen_vision_full168_static_fp16.engine
-F:\qwen_trt_export\vision_static_fp16\qwen_vision_full168_static_fp16.onnx
+F:\qwen_trt_export\vision_static_fp32\qwen_vision_full168_static_fp32.engine
+F:\qwen_trt_export\vision_static_fp32\qwen_vision_full168_static_fp32.onnx
+F:\qwen_trt_export\nvfp4_trt\qwen_text_36layer_nvfp4_seq576_hidden_choice_trt.engine
+F:\qwen_trt_export\nvfp4_trt\qwen_text_36layer_nvfp4_seq576_hidden_choice_trt.onnx
 F:\qwen_trt_export\qwen_trt_runtime_manifest.json
 ```
 
 Current behavior contract hash:
 
 ```text
-cf6c028ed0580f03db61300884c0b777bad6c750741998d64fdf98a0d5319f29
+cbf5827c7761cda0c61ad42eb9c83422ef881f7a82878ef1bea17ddb82ac8d54
 ```
 
-Fast runtime defaults:
+Current red/green Qwen choice-mode runtime defaults:
+
+```text
+--runtime-mode score
+--image-mode full
+--image-size 168
+--vision-engine F:\qwen_trt_export\vision_static_fp32\qwen_vision_full168_static_fp32.engine
+--text-engine F:\qwen_trt_export\nvfp4_trt\qwen_text_36layer_nvfp4_seq576_hidden_choice_trt.engine
+--label-decision-mode choice
+--text-output hidden
+--text-seq-len 576
+--text-position-mode auto
+--score-label-groups "red_stop_light,green_go_light"
+--require-manifest
+```
+
+Legacy rotating text-label runtime defaults:
 
 ```text
 --image-mode full
@@ -356,6 +421,26 @@ The active prompt contract tells Qwen to consider only hazards that overlap,
 intrude into, narrow, block, or are imminently entering the green planned
 corridor. Cones, barriers, pedestrians, vehicles, or other objects that are
 merely visible off to the side should not trigger steering or yielding.
+
+Production translation rule:
+
+```text
+Default runtime: no synthetic pixel fallbacks.
+Demo-only flags: --enable-visual-fallbacks,
+                 --enable-visual-signal-fallback,
+                 --enable-visual-construction-fallback,
+                 --enable-visual-stop-fallback
+```
+
+Those flags inspect rendered scene-board pixels such as clean traffic-light
+overlays or synthetic cone colors. They are useful for isolating sim-renderer
+and controller bugs, but they are not a road-ready perception mechanism. A
+production road run must leave those flags off and rely on Qwen label scoring,
+validated scene-board construction, and deterministic compiler bounds. After
+the fallback gate was added, a no-fallback probe still detected a red light on
+the saved sim frame, but it did not call construction on that same frame. That
+means the current construction video is a control-harness proof, not yet a
+production perception proof.
 
 After prompt or scene-board changes, the strict runtime manifest must be
 rewritten only after validation. The current manifest includes the prompt,
@@ -408,7 +493,9 @@ Current TensorRT fast path requirements are different:
 
 - NVIDIA GPU with TensorRT engine compatibility.
 - CUDA toolkit with `compute_120`/`sm_120` support for this RTX 5060 Ti setup.
-- TensorRT with FP4 support for the NVFP4 text engine.
+- TensorRT with FP4 support for the NVFP4 Qwen text engine. The current
+  red/green choice-mode runtime uses the text engine hidden output, then scores
+  the small answer-token set outside TensorRT.
 - External disk space for engines and ONNX files. Current artifacts live under
   `F:\qwen_trt_export` and are not committed.
 - Runtime manifest must match the active prompt/label/image/threshold contract.
@@ -470,6 +557,48 @@ py -3.11 tools\reasoned_trajectory_poc\qwen_trt_label_engine.py `
   gate
 ```
 
+Build and validate the current red/green Qwen choice-mode label scorer:
+
+```powershell
+py -3.11 tools\reasoned_trajectory_poc\qwen_trt_label_engine.py `
+  --artifact-dir F:\qwen_trt_export `
+  --label-decision-mode choice `
+  --text-output hidden `
+  --text-seq-len 576 `
+  --score-labels red_stop_light,green_go_light `
+  --image artifacts\reasoned_trajectory_poc\traffic_light_visual_probe_clean_signalhead\static\vlm_input_0000.png `
+  --image-size 168 `
+  --workspace-gb 8 `
+  build-text
+
+py -3.11 tools\reasoned_trajectory_poc\qwen_trt_label_engine.py `
+  --artifact-dir F:\qwen_trt_export `
+  --vision-engine F:\qwen_trt_export\vision_static_fp32\qwen_vision_full168_static_fp32.engine `
+  --text-engine F:\qwen_trt_export\nvfp4_trt\qwen_text_36layer_nvfp4_seq576_hidden_choice_trt.engine `
+  --label-decision-mode choice `
+  --text-output hidden `
+  --text-seq-len 576 `
+  --score-labels red_stop_light,green_go_light `
+  --image-size 168 `
+  --warmup 8 `
+  --deadline-ms 50 `
+  --write-manifest `
+  check-artifacts
+
+py -3.11 tools\reasoned_trajectory_poc\qwen_trt_label_engine.py `
+  --artifact-dir F:\qwen_trt_export `
+  --vision-engine F:\qwen_trt_export\vision_static_fp32\qwen_vision_full168_static_fp32.engine `
+  --text-engine F:\qwen_trt_export\nvfp4_trt\qwen_text_36layer_nvfp4_seq576_hidden_choice_trt.engine `
+  --label-decision-mode choice `
+  --text-output hidden `
+  --text-seq-len 576 `
+  --score-labels red_stop_light,green_go_light `
+  --image-size 168 `
+  --warmup 8 `
+  --deadline-ms 50 `
+  gate
+```
+
 Run the current synchronous mixed MetaDrive VLM demo at 2.5 m/s with VLM speed
 control disabled, so the comparison isolates lateral behavior:
 
@@ -522,47 +651,54 @@ artifacts/.../videos/vlm_<prefix>.mp4
 
 ## Latest Measured Demo
 
-Latest synchronous TensorRT lateral-only mixed demo:
+Latest mixed TensorRT VLM demo with construction, pedestrian labels, and a
+cycling red/green traffic light:
 
 ```text
-artifacts/reasoned_trajectory_poc/metadrive_trt_fast_mixed_300_20260523_220505_2p5mps_lateral_only_widecorridor_signfix
+artifacts/reasoned_trajectory_poc/metadrive_mixed_wait_stop_go_fullstop10_20260524_0328
 ```
 
 Summary:
 
 ```text
-stock frames:                  300
-stock mean speed:              2.3219 m/s
-stock min spawned distance:    1.0730 m
+stock frames:                  420
+stock mean speed:              1.0982 m/s
 
-VLM frames:                    300
-VLM valid publishes:           300
+VLM frames:                    420
+VLM valid publishes:           420
 VLM deadline misses:           0
-VLM same-frame publishes:      300 / 300
-VLM p99 latency:               38.906 ms
-VLM max latency:               39.366 ms
-VLM mean speed:                2.3217 m/s
-VLM min spawned distance:      1.3115 m
-VLM active lateral offset:     -1.25..0.0 MetaDrive m
-VLM dominant avoid source:     right_edge_s8_48_margin1.25
+VLM async max RTP age:         4 frames
+VLM p99 planner overhead:      3.583 ms
+VLM max planner overhead:      4.817 ms
+VLM mean speed:                0.9366 m/s
+VLM min construction clearance:1.949 m route-space
+VLM min pedestrian clearance:  2.546 m route-space
+VLM active lateral offset:     0.0..1.25 MetaDrive m
+VLM scene-board lateral offset:-1.25..0.0 openpilot m
+VLM dominant avoid source:     left_edge_s8_48_margin1.25
+red phase near-stop frames:    59 frames at <= 0.12 m/s
+green phase acceleration:      0.05 m/s at frame 260 -> 1.51 m/s at frame 280
 ```
 
 Side verification:
 
 ```text
-frame 24 visible construction side: image-right
-frame 24 direct Qwen scores: construction_right 5.28125, construction_left 4.30078125
-frame 24 RTP source: right_edge_s8_48_margin1.25
-frame 24 spawned construction laterals ahead: positive
-frame 24 active MetaDrive lateral target: negative
+spawned construction side:     left-side clusters, negative MetaDrive laterals
+RTP source:                    left_edge_s8_48_margin1.25
+controller target:             positive MetaDrive lateral, away from left cones
+scene-board path:              negative openpilot lateral, same physical path
+red light behavior:            slows to near-zero and waits through red
+green light behavior:          visual green clears the red stop plan and target
+                                speed returns to 2.5 m/s on construction-only
+                                frames
 ```
 
 Videos:
 
 ```text
-artifacts/.../videos/side_by_side_fast_mixed_300_sync_2p5mps_lateral_only_widecorridor_signfix.mp4
-artifacts/.../videos/stock_fast_mixed_300_sync_2p5mps_lateral_only_widecorridor_signfix.mp4
-artifacts/.../videos/vlm_fast_mixed_300_sync_2p5mps_lateral_only_widecorridor_signfix.mp4
+artifacts/.../videos/side_by_side_mixed_wait_stop_go_fullstop10.mp4
+artifacts/.../videos/stock_mixed_wait_stop_go_fullstop10.mp4
+artifacts/.../videos/vlm_mixed_wait_stop_go_fullstop10.mp4
 ```
 
 The matching manifest-gated 50 ms benchmark is:
@@ -573,6 +709,37 @@ p99_total_ms 34.458
 max_total_ms 34.458
 contract_sha256 cf6c028ed0580f03db61300884c0b777bad6c750741998d64fdf98a0d5319f29
 ```
+
+Latest red/green Qwen choice-mode signal gate:
+
+```text
+F:\qwen_trt_export\qwen_trt_runtime_manifest.json
+runtime_mode score
+label_decision_mode choice
+text_output hidden
+text_seq_len 576
+vision_engine F:\qwen_trt_export\vision_static_fp32\qwen_vision_full168_static_fp32.engine
+text_engine F:\qwen_trt_export\nvfp4_trt\qwen_text_36layer_nvfp4_seq576_hidden_choice_trt.engine
+contract_sha256 cbf5827c7761cda0c61ad42eb9c83422ef881f7a82878ef1bea17ddb82ac8d54
+```
+
+Latest hybrid full-label attempt:
+
+```text
+artifacts/reasoned_trajectory_poc/hybrid_seq576_benchmark_groups.json
+runtime: 576-token NVFP4 text scorer plus visual signal head
+signal_head_ms p99: 0.433
+trt_text_ms p99: 42.899
+total_ms p99: 65.910
+status: over the 50 ms frame budget
+```
+
+This means the red/green signal path is fixed under budget, but the complete
+all-label production path is not finished. The remaining bottleneck is the
+36-layer text tower at the current verbose prompt length. The next production
+path must keep the auditable label-scoring contract while making construction,
+pedestrian, vehicle, and related groups fast and reliable under the same
+manifest-gated runtime.
 
 ## Git Hygiene
 
