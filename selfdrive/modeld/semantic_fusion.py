@@ -5,10 +5,10 @@ import numpy as np
 from .constants import ModelConstants, Plan
 
 
-NEAR_HORIZON_S = 0.7
-MID_HORIZON_S = 2.5
-MID_ALPHA_START = 0.15
-MID_ALPHA_END = 0.6
+NEAR_HORIZON_S = 0.0
+MID_HORIZON_S = 0.0
+MID_ALPHA_START = 1.0
+MID_ALPHA_END = 1.0
 
 
 @dataclass
@@ -44,13 +44,7 @@ def _safe_float(value, default: float = 0.0) -> float:
 
 def _weights_for_t_idxs(t_idxs) -> np.ndarray:
   t = np.asarray(t_idxs, dtype=np.float32)
-  weights = np.zeros_like(t)
-
-  mid = (t >= NEAR_HORIZON_S) & (t < MID_HORIZON_S)
-  if np.any(mid):
-    weights[mid] = np.interp(t[mid], [NEAR_HORIZON_S, MID_HORIZON_S], [MID_ALPHA_START, MID_ALPHA_END])
-  weights[t >= MID_HORIZON_S] = 1.0
-  return weights[:, None]
+  return np.ones_like(t)[:, None]
 
 
 def _as_float32_array(values, expected_len: int) -> np.ndarray | None:

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import copy
 import importlib
 import json
 import os
@@ -155,8 +156,38 @@ def _trace_response_debug_fields(response: dict[str, Any]) -> dict[str, Any]:
     "expertStepCalls": runtime_profile.get("expert_step_calls"),
     "runtimeTotalSeconds": runtime_profile.get("total_seconds"),
     "fullGenerationCacheHit": runtime_profile.get("vlm_full_generation_cache_hit"),
+    "trustedReplayAllowed": runtime_profile.get("vlm_full_generation_cache_trusted_replay_allowed"),
+    "trustedReplayRequested": prefix_cache.get("trustedReplayRequested"),
+    "trustedReplayDisabledForDiffusionFreshness": prefix_cache.get("trustedReplayDisabledForDiffusionFreshness"),
+    "dflashTrustedReplayAllowed": runtime_profile.get("dflash_full_generation_cache_trusted_replay_allowed"),
+    "dflashFullGenerationCacheHit": runtime_profile.get("dflash_full_generation_cache_hit"),
+    "fullGenerationWindowSignatureMatch": runtime_profile.get("vlm_full_generation_cache_window_signature_match"),
+    "fullGenerationPromptCacheContextExact": runtime_profile.get("vlm_full_generation_prompt_cache_context_exact"),
+    "fullGenerationPromptCacheContextBlocked": runtime_profile.get(
+      "vlm_full_generation_cache_disabled_without_exact_prompt_cache_context"
+    ),
+    "dflashFullGenerationWindowSignatureMatch": runtime_profile.get(
+      "dflash_full_generation_cache_window_signature_match"
+    ),
+    "dflashFullGenerationPromptCacheContextExact": runtime_profile.get(
+      "dflash_full_generation_prompt_cache_context_exact"
+    ),
+    "dflashFullGenerationPromptCacheContextBlocked": runtime_profile.get(
+      "dflash_full_generation_cache_disabled_without_exact_prompt_cache_context"
+    ),
+    "sourceCachePromptCacheBlocked": runtime_profile.get(
+      "streaming_vlm_draft_verify_source_cache_prompt_cache_blocked"
+    ),
+    "servedFromLastValidCache": debug.get("servedFromLastValidCache"),
+    "forceVlmRefresh": debug.get("forceVlmRefresh"),
     "adaptiveFlowCacheHit": runtime_profile.get("adaptive_flow_cache_hit"),
     "adaptiveFlowCacheMiss": runtime_profile.get("adaptive_flow_cache_miss"),
+    "adaptiveFlowCacheKeyMode": runtime_profile.get("adaptive_flow_cache_key_mode"),
+    "adaptiveFlowMiddleVelocityReused": runtime_profile.get("adaptive_flow_middle_velocity_reused"),
+    "adaptiveFlowInitialNoiseReused": runtime_profile.get("adaptive_flow_initial_noise_reused"),
+    "adaptiveFlowMiddleVelocityExpertStepSkipped": runtime_profile.get(
+      "adaptive_flow_middle_velocity_expert_step_skipped"
+    ),
     "adaptiveFlowActionCacheHit": runtime_profile.get("adaptive_flow_action_cache_hit"),
     "adaptiveFlowActionCacheMiss": runtime_profile.get("adaptive_flow_action_cache_miss"),
     "adaptiveFlowSelectedSteps": runtime_profile.get("adaptive_flow_selected_steps"),
@@ -179,6 +210,7 @@ def _trace_response_debug_fields(response: dict[str, Any]) -> dict[str, Any]:
     "prefixReason": prefix_cache.get("reason"),
     "streamingReuseMode": prefix_cache.get("streamingReuseMode"),
     "streamingReuseUnverified": prefix_cache.get("streamingReuseUnverified"),
+    "refreshDue": prefix_cache.get("refreshDue"),
     "streamingReuseOverlapRatio": prefix_cache.get("streamingReuseOverlapRatio"),
     "streamingReuseOverlapSource": prefix_cache.get("streamingReuseOverlapSource"),
     "languageVisualTokenSpans": prefix_cache.get("languageVisualTokenSpans"),
@@ -341,6 +373,108 @@ class AlpamayoPcEndpoint:
     self.adapter = adapter or NoAdapter()
     self.trace_logger = trace_logger or PcTraceLogger()
     self.adapter_lock = threading.Lock()
+    self.last_valid_lock = threading.Lock()
+    self.last_valid_response: dict[str, Any] | None = None
+    self.last_valid_latest_frame_id = -1
+    self.refresh_lock = threading.Lock()
+    self.refresh_thread: threading.Thread | None = None
+
+  def _store_last_valid(self, response: dict[str, Any], latest_frame_id: int | None = None) -> None:
+    with self.last_valid_lock:
+      self.last_valid_response = copy.deepcopy(response)
+      if latest_frame_id is not None:
+        self.last_valid_latest_frame_id = int(latest_frame_id)
+
+  def _last_valid_frame_gap(self, latest_frame_id: int) -> int | None:
+    with self.last_valid_lock:
+      if self.last_valid_response is None or self.last_valid_latest_frame_id < 0:
+        return None
+      return int(latest_frame_id) - int(self.last_valid_latest_frame_id)
+
+  def _cached_last_valid_response(self, latest_frame_id: int) -> dict[str, Any] | None:
+    with self.last_valid_lock:
+      if self.last_valid_response is None:
+        return None
+      response = copy.deepcopy(self.last_valid_response)
+    semantic = response.get("semanticPlan")
+    if isinstance(semantic, dict):
+      debug = semantic.setdefault("debug", {})
+      if isinstance(debug, dict):
+        debug["servedFromLastValidCache"] = True
+        debug["servedFromLastValidCacheLatestFrameId"] = latest_frame_id
+        runtime_profile = debug.setdefault("runtimeProfile", {})
+        if isinstance(runtime_profile, dict):
+          runtime_profile["pc_endpoint_served_from_last_valid_cache"] = 1
+      semantic["age"] = 0.0
+    return response
+
+  @staticmethod
+  def _response_requests_background_refresh(response: dict[str, Any]) -> bool:
+    semantic = response.get("semanticPlan", response)
+    if not isinstance(semantic, dict):
+      return False
+    debug = semantic.get("debug")
+    if not isinstance(debug, dict):
+      return False
+    frame_cache = debug.get("frameCacheStats")
+    if not isinstance(frame_cache, dict):
+      return False
+    prefix_cache = frame_cache.get("vlmPrefixCache")
+    if not isinstance(prefix_cache, dict) or not bool(prefix_cache.get("refreshDue")):
+      return False
+    if _reasoning_generation_disabled():
+      streaming_reuse_mode = str(prefix_cache.get("streamingReuseMode", ""))
+      if bool(prefix_cache.get("trustedReplayAllowed")) and streaming_reuse_mode == "trusted_full_replay_no_reasoning":
+        return False
+      if streaming_reuse_mode == "shifted_kv_current_state_suffix":
+        return False
+    return True
+
+  def _start_background_refresh_request(self, request: dict[str, Any]) -> None:
+    with self.refresh_lock:
+      if self.refresh_thread is not None and self.refresh_thread.is_alive():
+        return
+      refresh_request = copy.deepcopy(request)
+      runtime_config = refresh_request.setdefault("runtimeConfig", {})
+      if isinstance(runtime_config, dict):
+        runtime_config["alpamayoForceVlmRefresh"] = True
+      self.refresh_thread = threading.Thread(
+        target=self._run_background_refresh,
+        args=(refresh_request,),
+        daemon=True,
+      )
+      self.refresh_thread.start()
+
+  def _start_background_refresh_if_needed(self, request: dict[str, Any], response: dict[str, Any]) -> None:
+    if not self._response_requests_background_refresh(response):
+      return
+    self._start_background_refresh_request(request)
+
+  def _run_background_refresh(self, request: dict[str, Any]) -> None:
+    start_ns = time.monotonic_ns()
+    latest_frame_id = _latest_frame_id(request)
+    outcome = "background_refresh_valid"
+    reason = ""
+    response_payload: dict[str, Any] | None = None
+    try:
+      with self.adapter_lock:
+        response_payload = self.adapter.infer(request)
+      validate_response(response_payload, require_deepstack_reasoning=True)
+      self._store_last_valid(response_payload, latest_frame_id)
+    except Exception as exc:
+      outcome = "background_refresh_error"
+      reason = str(exc)
+      response_payload = _error_response("unavailable", reason)
+    elapsed_ms = (time.monotonic_ns() - start_ns) / 1e6
+    self.trace_logger.log(
+      "pc_alpamayo_background_refresh",
+      statusCode=int(HTTPStatus.OK if not reason else HTTPStatus.SERVICE_UNAVAILABLE),
+      outcome=outcome,
+      reason=reason,
+      latestFrameId=latest_frame_id,
+      latencyMs=elapsed_ms,
+      **_trace_response_debug_fields(response_payload or {}),
+    )
 
   def handle_payload(self, body: bytes, content_type: str = REQUEST_CONTENT_TYPE) -> tuple[int, bytes, str]:
     start_ns = time.monotonic_ns()
@@ -356,9 +490,35 @@ class AlpamayoPcEndpoint:
       request = decode_payload(body)
       latest_frame_id = _latest_frame_id(request)
       validate_request(request)
-      with self.adapter_lock:
-        response_payload = self.adapter.infer(request)
+      acquired = False
+      cached_for_gap = False
+      last_valid_gap = self._last_valid_frame_gap(latest_frame_id)
+      if last_valid_gap is not None and last_valid_gap > 12:
+        cached_response = self._cached_last_valid_response(latest_frame_id)
+        if cached_response is not None:
+          response_payload = cached_response
+          outcome = "stale_gap_cached_last_valid"
+          cached_for_gap = True
+          self._start_background_refresh_request(request)
+      if not cached_for_gap:
+        acquired = self.adapter_lock.acquire(blocking=False)
+        if not acquired:
+          cached_response = self._cached_last_valid_response(latest_frame_id)
+          if cached_response is None:
+            self.adapter_lock.acquire()
+            acquired = True
+          else:
+            response_payload = cached_response
+            outcome = "adapter_busy_cached_last_valid"
+        if acquired:
+          try:
+            response_payload = self.adapter.infer(request)
+          finally:
+            self.adapter_lock.release()
       validate_response(response_payload, require_deepstack_reasoning=True)
+      if outcome not in ("adapter_busy_cached_last_valid", "stale_gap_cached_last_valid"):
+        self._store_last_valid(response_payload, latest_frame_id)
+      self._start_background_refresh_if_needed(request, response_payload)
     except ContractError as exc:
       status_code = HTTPStatus.BAD_REQUEST
       outcome = "contract_error"

@@ -26,7 +26,7 @@ STREAM_TO_ALPAMAYO_CAMERA_INDEX = {
 }
 DEFAULT_NUM_HISTORY_STEPS = 16
 DEFAULT_HISTORY_DT_S = 0.1
-DEFAULT_MAX_GENERATION_LENGTH = 40
+DEFAULT_MAX_GENERATION_LENGTH = 16
 DEFAULT_STATIC_GRAPH_MAX_PROMPT_TOKENS = 4096
 DEFAULT_STATIC_GRAPH_MAX_VISUAL_TOKENS = 4096
 DEFAULT_TARGET_MODEL_WIN = Path(r"E:\ture_opamayo\openpilot_alpamayo\Alpamayo-1.5-10B-finetuned")
@@ -56,6 +56,7 @@ FLASHDRIVEVLA_TARGET_MODEL_NAMES = (
 OPENPILOT_TOKENIZED_METADATA_KEYS = (
   "_openpilot_prefix_semantic_signature",
   "_openpilot_visual_token_count",
+  "_openpilot_fused_input_ids_signature",
 )
 
 
@@ -91,6 +92,9 @@ class LocalAlpamayoConfig:
   greedy: bool = True
   manual_generation: bool = True
   skip_vlm_generation: bool = False
+  disable_reasoning_generation: bool = False
+  no_reasoning_trust_shifted_prompt_cache: bool = False
+  require_state_fresh_no_reasoning: bool = True
   device_map_mode: str = "current_split"
   model_dtype: str = "bfloat16"
   autocast_dtype: str = "bfloat16"
@@ -122,7 +126,8 @@ class LocalAlpamayoConfig:
   vlm_prefix_cache_max_entries: int = 4
   streaming_vlm_prefix_reuse: bool = True
   streaming_vlm_trust_shifted_draft: bool = True
-  streaming_vlm_source_cache_draft_verify_unverified: bool = True
+  streaming_vlm_source_cache_draft_verify_unverified: bool = False
+  streaming_vlm_trusted_replay_refresh_interval: int = 24
   streaming_vlm_prefix_reuse_min_overlap: float = 0.5
   streaming_vlm_prefix_reuse_max_chain: int = 128
   dflash_enabled: bool = True
@@ -811,6 +816,28 @@ def _prefix_semantic_signature(torch_mod: Any, tokenized_data: dict[str, Any]) -
   )
 
 
+def _tensor_crc32_signature(torch_mod: Any, value: Any, *, max_elements: int = 32768) -> tuple[Any, ...]:
+  try:
+    if torch_mod is None or not isinstance(value, torch_mod.Tensor):
+      return ()
+    tensor = value.detach()
+    numel = int(tensor.numel())
+    meta = (
+      "tensor_crc32_v1",
+      tuple(int(item) for item in tensor.shape),
+      str(tensor.dtype),
+      numel,
+    )
+    if numel > max(0, int(max_elements)):
+      return meta + ("content_skipped_large",)
+    if getattr(tensor.device, "type", str(tensor.device).split(":")[0]) != "cpu":
+      tensor = tensor.to("cpu", non_blocking=False)
+    tensor = tensor.contiguous()
+    return meta + (zlib.crc32(tensor.numpy().tobytes()) & 0xFFFFFFFF,)
+  except Exception as exc:
+    return ("tensor_crc32_error", type(exc).__name__)
+
+
 def _visual_token_count_from_grids(image_grid: Any, video_grid: Any, merge_size: int) -> int:
   merge_area = max(1, int(merge_size) * int(merge_size))
   visual_tokens = 0
@@ -944,6 +971,9 @@ def config_from_env() -> LocalAlpamayoConfig:
     greedy=_env_bool("ALPAMAYO_GREEDY", True),
     manual_generation=_env_bool("ALPAMAYO_MANUAL_GENERATION", True),
     skip_vlm_generation=_env_bool("ALPAMAYO_SKIP_VLM_GENERATION", False),
+    disable_reasoning_generation=_env_bool("ALPAMAYO_DISABLE_REASONING_GENERATION", False),
+    no_reasoning_trust_shifted_prompt_cache=_env_bool("ALPAMAYO_NO_REASONING_TRUST_SHIFTED_PROMPT_CACHE", False),
+    require_state_fresh_no_reasoning=_env_bool("ALPAMAYO_REQUIRE_STATE_FRESH_NO_REASONING", True),
     device_map_mode=os.environ.get("ALPAMAYO_DEVICE_MAP_MODE", "current_split"),
     model_dtype=os.environ.get("ALPAMAYO_MODEL_DTYPE", "bfloat16"),
     autocast_dtype=os.environ.get("ALPAMAYO_AUTOCAST_DTYPE", "bfloat16"),
@@ -976,8 +1006,9 @@ def config_from_env() -> LocalAlpamayoConfig:
     streaming_vlm_trust_shifted_draft=_env_bool("ALPAMAYO_STREAMING_VLM_TRUST_SHIFTED_DRAFT", True),
     streaming_vlm_source_cache_draft_verify_unverified=_env_bool(
       "ALPAMAYO_STREAMING_VLM_SOURCE_CACHE_DRAFT_VERIFY_UNVERIFIED",
-      True,
+      False,
     ),
+    streaming_vlm_trusted_replay_refresh_interval=_env_int("ALPAMAYO_STREAMING_VLM_TRUSTED_REPLAY_REFRESH_INTERVAL", 24),
     streaming_vlm_prefix_reuse_min_overlap=_env_float("ALPAMAYO_STREAMING_VLM_PREFIX_REUSE_MIN_OVERLAP", 0.5),
     streaming_vlm_prefix_reuse_max_chain=_env_int("ALPAMAYO_STREAMING_VLM_PREFIX_REUSE_MAX_CHAIN", 128),
     dflash_enabled=_env_bool("ALPAMAYO_DFLASH_ENABLED", True),
@@ -1096,6 +1127,27 @@ def _patch_tie_weights_compat() -> None:
   alpamayo_mod.Alpamayo1_5.tie_weights = tie_weights
 
 
+def _full_generation_exact_current_window(
+  prefix_cache_entry: dict[str, Any],
+  *,
+  signature_key: str = "full_vlm_window_signature",
+  context_exact_key: str = "full_vlm_prompt_cache_context_exact",
+) -> tuple[bool, bool, bool]:
+  current_window_signature = prefix_cache_entry.get("current_window_signature")
+  stored_window_signature = prefix_cache_entry.get(signature_key)
+  window_signature_match = bool(
+    current_window_signature is not None
+    and stored_window_signature is not None
+    and stored_window_signature == current_window_signature
+  )
+  prompt_cache_context_exact = bool(prefix_cache_entry.get(context_exact_key))
+  return (
+    bool(window_signature_match and prompt_cache_context_exact),
+    window_signature_match,
+    prompt_cache_context_exact,
+  )
+
+
 def _patch_manual_greedy_generation() -> None:
   import copy
   import torch
@@ -1104,6 +1156,997 @@ def _patch_manual_greedy_generation() -> None:
 
   if getattr(alpamayo_mod.Alpamayo1_5, "_openpilot_manual_greedy_patch", False):
     return
+
+  def _cache_layer_pairs(cache: Any) -> list[tuple[Any, Any]]:
+    layers = getattr(cache, "layers", None)
+    if not isinstance(layers, (list, tuple)) or not layers:
+      return []
+    pairs: list[tuple[Any, Any]] = []
+    for layer in layers:
+      key_states = getattr(layer, "keys", None)
+      value_states = getattr(layer, "values", None)
+      if key_states is None or value_states is None or not hasattr(key_states, "shape") or not hasattr(value_states, "shape"):
+        return []
+      pairs.append((key_states, value_states))
+    return pairs
+
+  def _dynamic_cache_from_buffered_prefix(
+    model_self: Any,
+    source_pairs: list[tuple[Any, Any]],
+    prefix_len: int,
+    *,
+    pool_attr: str,
+    runtime_profile: dict[str, float | int] | None,
+    metric_prefix: str,
+  ) -> tuple[Any, list[tuple[Any, Any]]] | None:
+    if not source_pairs or int(prefix_len) <= 0:
+      return None
+    try:
+      buffer_pool_enabled = bool(int(os.environ.get("ALPAMAYO_SHIFTED_KV_BUFFER_POOL", "0")))
+    except Exception:
+      buffer_pool_enabled = False
+    if not buffer_pool_enabled:
+      if runtime_profile is not None:
+        runtime_profile[f"{metric_prefix}_buffered"] = 0
+      return None
+    try:
+      from transformers.cache_utils import DynamicCache
+
+      pool = getattr(model_self, pool_attr, None)
+      if not isinstance(pool, dict):
+        pool = {}
+        setattr(model_self, pool_attr, pool)
+
+      rebuilt_pairs: list[tuple[Any, Any]] = []
+      allocated_layers = 0
+      reused_layers = 0
+      max_capacity = 0
+      for layer_idx, (source_key, source_value) in enumerate(source_pairs):
+        if int(source_key.shape[-2]) < int(prefix_len) or int(source_value.shape[-2]) < int(prefix_len):
+          return None
+        key_capacity = max(int(prefix_len), int(source_key.shape[-2]))
+        value_capacity = max(int(prefix_len), int(source_value.shape[-2]))
+        max_capacity = max(max_capacity, key_capacity, value_capacity)
+        key_shape = tuple(int(dim) for dim in source_key.shape[:-2]) + (key_capacity, int(source_key.shape[-1]))
+        value_shape = tuple(int(dim) for dim in source_value.shape[:-2]) + (value_capacity, int(source_value.shape[-1]))
+        slot = pool.get(int(layer_idx))
+        key_buf = slot[0] if isinstance(slot, tuple) and len(slot) == 2 else None
+        value_buf = slot[1] if isinstance(slot, tuple) and len(slot) == 2 else None
+        if (
+          key_buf is None
+          or value_buf is None
+          or tuple(int(dim) for dim in key_buf.shape) != key_shape
+          or tuple(int(dim) for dim in value_buf.shape) != value_shape
+          or key_buf.device != source_key.device
+          or value_buf.device != source_value.device
+          or key_buf.dtype != source_key.dtype
+          or value_buf.dtype != source_value.dtype
+        ):
+          key_buf = torch.empty(key_shape, device=source_key.device, dtype=source_key.dtype)
+          value_buf = torch.empty(value_shape, device=source_value.device, dtype=source_value.dtype)
+          pool[int(layer_idx)] = (key_buf, value_buf)
+          allocated_layers += 1
+        else:
+          reused_layers += 1
+        target_key = key_buf[..., :prefix_len, :]
+        target_value = value_buf[..., :prefix_len, :]
+        target_key.copy_(source_key[..., :prefix_len, :], non_blocking=True)
+        target_value.copy_(source_value[..., :prefix_len, :], non_blocking=True)
+        rebuilt_pairs.append((target_key, target_value))
+      if runtime_profile is not None:
+        runtime_profile[f"{metric_prefix}_buffered"] = 1
+        runtime_profile[f"{metric_prefix}_buffer_allocated_layers"] = int(allocated_layers)
+        runtime_profile[f"{metric_prefix}_buffer_reused_layers"] = int(reused_layers)
+        runtime_profile[f"{metric_prefix}_buffer_capacity_tokens"] = int(max_capacity)
+      return DynamicCache(ddp_cache_data=rebuilt_pairs), rebuilt_pairs
+    except Exception as exc:
+      if runtime_profile is not None:
+        runtime_profile[f"{metric_prefix}_buffer_error"] = f"{type(exc).__name__}: {exc}"
+      return None
+
+  def _build_shifted_visual_prefix_cache(
+    model_self: Any,
+    source_cache: Any,
+    shifted_plan: dict[str, Any],
+    *,
+    prefix_len: int,
+    runtime_profile: dict[str, float | int] | None,
+  ) -> Any | None:
+    if source_cache is None or not isinstance(shifted_plan, dict) or not shifted_plan.get("valid"):
+      return None
+    source_pairs = _cache_layer_pairs(source_cache)
+    if not source_pairs:
+      return None
+    try:
+      from transformers.cache_utils import DynamicCache
+
+      buffered = _dynamic_cache_from_buffered_prefix(
+        model_self,
+        source_pairs,
+        int(prefix_len),
+        pool_attr="_openpilot_shifted_kv_reconstruct_pool",
+        runtime_profile=runtime_profile,
+        metric_prefix="shifted_prompt_kv_reconstruct",
+      )
+      if buffered is None:
+        prompt_cache = None
+        rebuilt_pairs: list[tuple[Any, Any]] = []
+        if runtime_profile is not None:
+          runtime_profile["shifted_prompt_kv_reconstruct_buffered"] = 0
+        for source_key, source_value in source_pairs:
+          if int(source_key.shape[-2]) < int(prefix_len) or int(source_value.shape[-2]) < int(prefix_len):
+            return None
+          rebuilt_pairs.append((
+            source_key[..., :prefix_len, :].detach().clone().contiguous(),
+            source_value[..., :prefix_len, :].detach().clone().contiguous(),
+          ))
+      else:
+        prompt_cache, rebuilt_pairs = buffered
+      ranges = [item for item in shifted_plan.get("ranges", []) if isinstance(item, dict)]
+      copied_tokens = 0
+      for (source_key, source_value), (target_key, target_value) in zip(source_pairs, rebuilt_pairs, strict=True):
+        for item in ranges:
+          src_start = int(item.get("source_language_token_start", -1))
+          cur_start = int(item.get("current_language_token_start", -1))
+          token_count = int(item.get("token_count", 0) or 0)
+          if src_start < 0 or cur_start < 0 or token_count <= 0:
+            continue
+          src_end = src_start + token_count
+          cur_end = cur_start + token_count
+          if src_end > int(source_key.shape[-2]) or cur_end > int(prefix_len):
+            continue
+          target_key[..., cur_start:cur_end, :].copy_(source_key[..., src_start:src_end, :])
+          target_value[..., cur_start:cur_end, :].copy_(source_value[..., src_start:src_end, :])
+          copied_tokens += token_count
+      if runtime_profile is not None:
+        runtime_profile["shifted_prompt_kv_reconstruct_layers"] = len(rebuilt_pairs)
+        runtime_profile["shifted_prompt_kv_reconstruct_copied_tokens"] = int(copied_tokens)
+        runtime_profile["shifted_prompt_kv_reconstruct_prefix_len"] = int(prefix_len)
+      if prompt_cache is None:
+        prompt_cache = DynamicCache(ddp_cache_data=rebuilt_pairs)
+      return prompt_cache
+    except Exception as exc:
+      if runtime_profile is not None:
+        runtime_profile["shifted_prompt_kv_reconstruct_error"] = f"{type(exc).__name__}: {exc}"
+      return None
+
+  def _shifted_prompt_recompute_start(
+    input_ids: Any,
+    source_sequences: Any,
+    spans: list[Any],
+    shifted_plan: dict[str, Any],
+    *,
+    visual_prefix_end: int,
+    input_seq_len: int,
+  ) -> tuple[int, str]:
+    first_text_mismatch = int(input_seq_len)
+    try:
+      if source_sequences is not None and hasattr(source_sequences, "shape") and int(source_sequences.shape[1]) > 0:
+        compare_len = min(int(input_seq_len), int(source_sequences.shape[1]))
+        source_ids = source_sequences[:, :compare_len].to(device=input_ids.device, dtype=input_ids.dtype)
+        mismatches = (input_ids[:, :compare_len] != source_ids).any(dim=0).nonzero(as_tuple=False).flatten()
+        if int(mismatches.numel()) > 0:
+          first_text_mismatch = int(mismatches[0].item())
+    except Exception:
+      first_text_mismatch = int(visual_prefix_end)
+
+    matched_current_ranges: set[tuple[int, int]] = set()
+    for item in shifted_plan.get("ranges", []):
+      if not isinstance(item, dict):
+        continue
+      cur_start = int(item.get("current_language_token_start", -1))
+      token_count = int(item.get("token_count", 0) or 0)
+      if cur_start >= 0 and token_count > 0:
+        matched_current_ranges.add((cur_start, cur_start + token_count))
+
+    first_unmatched_visual = int(input_seq_len)
+    for span in spans:
+      if not isinstance(span, dict):
+        continue
+      start = int(span.get("language_token_start", -1))
+      end = int(span.get("language_token_end", -1))
+      if start < 0 or end <= start:
+        continue
+      if (start, end) not in matched_current_ranges:
+        first_unmatched_visual = min(first_unmatched_visual, start)
+
+    recompute_start = min(int(visual_prefix_end), int(first_text_mismatch), int(first_unmatched_visual))
+    reason = "visual_prefix_end"
+    if recompute_start == first_text_mismatch and first_text_mismatch < visual_prefix_end:
+      reason = "source_input_ids_mismatch"
+    if recompute_start == first_unmatched_visual and first_unmatched_visual < visual_prefix_end:
+      reason = "first_unmatched_visual_span"
+
+    for span in spans:
+      if not isinstance(span, dict):
+        continue
+      start = int(span.get("language_token_start", -1))
+      end = int(span.get("language_token_end", -1))
+      if start >= 0 and start < recompute_start < end:
+        recompute_start = start
+        reason = f"{reason}:aligned_to_visual_span"
+        break
+    return int(recompute_start), reason
+
+  def _select_image_suffix_kwargs(
+    suffix_kwargs: dict[str, Any],
+    spans: list[Any],
+    *,
+    recompute_start: int,
+    runtime_profile: dict[str, float | int] | None,
+  ) -> bool:
+    for key in (
+      "pixel_values_videos",
+      "video_grid_thw",
+      "_openpilot_precomputed_video_features",
+      "_openpilot_precomputed_patch_pos_embeds",
+      "cache_position_ids",
+      "cache_rope_deltas",
+    ):
+      suffix_kwargs.pop(key, None)
+
+    selected: list[tuple[int, dict[str, Any]]] = []
+    for idx, span in enumerate(spans):
+      if not isinstance(span, dict):
+        continue
+      start = int(span.get("language_token_start", -1))
+      end = int(span.get("language_token_end", -1))
+      if start < 0 or end <= start:
+        continue
+      if start < int(recompute_start) < end:
+        return False
+      if end > int(recompute_start):
+        selected.append((idx, span))
+
+    if not selected:
+      for key in (
+        "pixel_values",
+        "image_grid_thw",
+        "_openpilot_precomputed_image_features",
+      ):
+        suffix_kwargs.pop(key, None)
+      if runtime_profile is not None:
+        runtime_profile["shifted_prompt_kv_current_suffix_image_blocks"] = 0
+      return True
+
+    image_grid = suffix_kwargs.get("image_grid_thw")
+    pixel_values = suffix_kwargs.get("pixel_values")
+    if image_grid is None or pixel_values is None or not hasattr(image_grid, "shape") or not hasattr(pixel_values, "shape"):
+      return False
+
+    try:
+      selected_indices = [int(idx) for idx, _span in selected]
+      if not selected_indices or max(selected_indices) >= int(image_grid.shape[0]):
+        return False
+      grid_cpu = image_grid.detach().cpu().tolist()
+      patch_counts: list[int] = []
+      for row in grid_cpu:
+        patch_count = 1
+        for dim in row:
+          patch_count *= int(dim)
+        patch_counts.append(int(patch_count))
+      pixel_ranges: list[tuple[int, int]] = []
+      offset = 0
+      for patch_count in patch_counts:
+        pixel_ranges.append((offset, offset + int(patch_count)))
+        offset += int(patch_count)
+      if offset > int(pixel_values.shape[0]):
+        return False
+      index_tensor = torch.tensor(selected_indices, device=image_grid.device, dtype=torch.long)
+      suffix_kwargs["image_grid_thw"] = image_grid.index_select(0, index_tensor).contiguous()
+      suffix_kwargs["pixel_values"] = torch.cat(
+        [pixel_values[start:end] for start, end in (pixel_ranges[idx] for idx in selected_indices)],
+        dim=0,
+      ).contiguous()
+      suffix_kwargs.pop("_openpilot_precomputed_image_features", None)
+      if runtime_profile is not None:
+        runtime_profile["shifted_prompt_kv_current_suffix_image_blocks"] = len(selected_indices)
+        runtime_profile["shifted_prompt_kv_current_suffix_image_patch_tokens"] = int(suffix_kwargs["pixel_values"].shape[0])
+      return True
+    except Exception as exc:
+      if runtime_profile is not None:
+        runtime_profile["shifted_prompt_kv_current_suffix_image_subset_error"] = f"{type(exc).__name__}: {exc}"
+      return False
+
+  def _clone_cache_prefix(
+    model_self: Any,
+    cache: Any,
+    prefix_len: int,
+    *,
+    runtime_profile: dict[str, float | int] | None,
+  ) -> Any | None:
+    pairs = _cache_layer_pairs(cache)
+    if not pairs:
+      return None
+    try:
+      from transformers.cache_utils import DynamicCache
+
+      buffered = _dynamic_cache_from_buffered_prefix(
+        model_self,
+        pairs,
+        int(prefix_len),
+        pool_attr="_openpilot_shifted_kv_prefix_clone_pool",
+        runtime_profile=runtime_profile,
+        metric_prefix="shifted_prompt_kv_clone_prefix",
+      )
+      if buffered is not None:
+        return buffered[0]
+      if runtime_profile is not None:
+        runtime_profile["shifted_prompt_kv_clone_prefix_buffered"] = 0
+      rebuilt_pairs: list[tuple[Any, Any]] = []
+      for key_states, value_states in pairs:
+        if int(key_states.shape[-2]) < int(prefix_len) or int(value_states.shape[-2]) < int(prefix_len):
+          return None
+        rebuilt_pairs.append((
+          key_states[..., :prefix_len, :].detach().clone().contiguous(),
+          value_states[..., :prefix_len, :].detach().clone().contiguous(),
+        ))
+      return DynamicCache(ddp_cache_data=rebuilt_pairs)
+    except Exception:
+      return None
+
+  def _copy_cache_range(target_cache: Any, source_cache: Any, start: int, end: int) -> bool:
+    target_pairs = _cache_layer_pairs(target_cache)
+    source_pairs = _cache_layer_pairs(source_cache)
+    if not target_pairs or not source_pairs or len(target_pairs) != len(source_pairs):
+      return False
+    try:
+      for target, source in zip(target_pairs, source_pairs, strict=True):
+        target_key, target_value = target
+        source_key, source_value = source
+        if int(target_key.shape[-2]) < int(end) or int(source_key.shape[-2]) < int(end):
+          return False
+        target_key[..., start:end, :].copy_(source_key[..., start:end, :])
+        target_value[..., start:end, :].copy_(source_value[..., start:end, :])
+      return True
+    except Exception:
+      return False
+
+  def _stored_prompt_cache_for_shifted_path(prompt_cache: Any, runtime_profile: dict[str, float | int] | None) -> Any:
+    try:
+      store_deepcopy = bool(int(os.environ.get("ALPAMAYO_SHIFTED_KV_STORE_PROMPT_CACHE_DEEPCOPY", "1")))
+    except Exception:
+      store_deepcopy = True
+    if store_deepcopy:
+      if runtime_profile is not None:
+        runtime_profile["vlm_full_generation_prompt_cache_store_deepcopy"] = 1
+      return copy.deepcopy(prompt_cache)
+    if runtime_profile is not None:
+      runtime_profile["vlm_full_generation_prompt_cache_store_deepcopy"] = 0
+      runtime_profile["vlm_full_generation_prompt_cache_store_borrowed"] = 1
+    return prompt_cache
+
+  def _unmatched_visual_spans(spans: list[Any], shifted_plan: dict[str, Any]) -> list[tuple[int, dict[str, Any]]]:
+    matched_current_ranges: set[tuple[int, int]] = set()
+    for item in shifted_plan.get("ranges", []):
+      if not isinstance(item, dict):
+        continue
+      cur_start = int(item.get("current_language_token_start", -1))
+      token_count = int(item.get("token_count", 0) or 0)
+      if cur_start >= 0 and token_count > 0:
+        matched_current_ranges.add((cur_start, cur_start + token_count))
+    unmatched: list[tuple[int, dict[str, Any]]] = []
+    for idx, span in enumerate(spans):
+      if not isinstance(span, dict):
+        continue
+      start = int(span.get("language_token_start", -1))
+      end = int(span.get("language_token_end", -1))
+      if start < 0 or end <= start:
+        continue
+      if (start, end) not in matched_current_ranges:
+        unmatched.append((idx, span))
+    unmatched.sort(key=lambda item: int(item[1].get("language_token_start", 0)))
+    return unmatched
+
+  def _select_exact_image_blocks_kwargs(
+    span_kwargs: dict[str, Any],
+    spans: list[Any],
+    selected_indices: list[int],
+    *,
+    runtime_profile: dict[str, float | int] | None,
+  ) -> bool:
+    for key in (
+      "pixel_values_videos",
+      "video_grid_thw",
+      "_openpilot_precomputed_image_features",
+      "_openpilot_precomputed_video_features",
+      "_openpilot_precomputed_patch_pos_embeds",
+      "cache_position_ids",
+      "cache_rope_deltas",
+    ):
+      span_kwargs.pop(key, None)
+    image_grid = span_kwargs.get("image_grid_thw")
+    pixel_values = span_kwargs.get("pixel_values")
+    if image_grid is None or pixel_values is None or not hasattr(image_grid, "shape") or not hasattr(pixel_values, "shape"):
+      return False
+    try:
+      if not selected_indices or max(selected_indices) >= int(image_grid.shape[0]):
+        return False
+      grid_cpu = image_grid.detach().cpu().tolist()
+      pixel_ranges: list[tuple[int, int]] = []
+      offset = 0
+      for row in grid_cpu:
+        patch_count = 1
+        for dim in row:
+          patch_count *= int(dim)
+        pixel_ranges.append((offset, offset + int(patch_count)))
+        offset += int(patch_count)
+      if offset > int(pixel_values.shape[0]):
+        return False
+      index_tensor = torch.tensor(selected_indices, device=image_grid.device, dtype=torch.long)
+      span_kwargs["image_grid_thw"] = image_grid.index_select(0, index_tensor).contiguous()
+      span_kwargs["pixel_values"] = torch.cat(
+        [pixel_values[start:end] for start, end in (pixel_ranges[idx] for idx in selected_indices)],
+        dim=0,
+      ).contiguous()
+      if runtime_profile is not None:
+        runtime_profile["shifted_prompt_kv_visual_fill_image_blocks"] = int(runtime_profile.get("shifted_prompt_kv_visual_fill_image_blocks", 0)) + len(selected_indices)
+        runtime_profile["shifted_prompt_kv_visual_fill_image_patch_tokens"] = int(runtime_profile.get("shifted_prompt_kv_visual_fill_image_patch_tokens", 0)) + int(span_kwargs["pixel_values"].shape[0])
+      return True
+    except Exception as exc:
+      if runtime_profile is not None:
+        runtime_profile["shifted_prompt_kv_visual_fill_error"] = f"{type(exc).__name__}: {exc}"
+      return False
+
+  def _visual_embeds_for_spans(
+    model_self: Any,
+    model_kwargs: dict[str, Any],
+    spans: list[Any],
+    selected_indices: list[int],
+    *,
+    runtime_profile: dict[str, float | int] | None,
+  ) -> dict[int, Any] | None:
+    image_grid = model_kwargs.get("image_grid_thw")
+    pixel_values = model_kwargs.get("pixel_values")
+    precomputed_image_features = model_kwargs.get("_openpilot_precomputed_image_features")
+    if image_grid is None or not hasattr(image_grid, "shape"):
+      return None
+    try:
+      if not selected_indices or max(selected_indices) >= int(image_grid.shape[0]):
+        return None
+      if precomputed_image_features is not None:
+        feature_items = None
+        if isinstance(precomputed_image_features, (list, tuple)) and len(precomputed_image_features) >= 1:
+          feature_items = precomputed_image_features[0]
+        if isinstance(feature_items, (list, tuple)) and max(selected_indices) < len(feature_items):
+          split: dict[int, Any] = {}
+          total_tokens = 0
+          for idx in selected_indices:
+            span = spans[idx]
+            token_count = int(span.get("token_count", 0) or 0) if isinstance(span, dict) else 0
+            if token_count <= 0:
+              return None
+            embeds = feature_items[idx]
+            if embeds is None or not hasattr(embeds, "shape") or int(embeds.shape[0]) != token_count:
+              return None
+            split[idx] = embeds
+            total_tokens += token_count
+          if runtime_profile is not None:
+            runtime_profile["shifted_prompt_kv_visual_fill_precomputed_hit"] = 1
+            runtime_profile["shifted_prompt_kv_visual_fill_precomputed_blocks"] = len(selected_indices)
+            runtime_profile["shifted_prompt_kv_visual_fill_precomputed_tokens"] = int(total_tokens)
+            runtime_profile["shifted_prompt_kv_visual_fill_visual_seconds"] = 0.0
+          return split
+      if pixel_values is None or not hasattr(pixel_values, "shape"):
+        return None
+      grid_cpu = image_grid.detach().cpu().tolist()
+      pixel_ranges: list[tuple[int, int]] = []
+      offset = 0
+      for row in grid_cpu:
+        patch_count = 1
+        for dim in row:
+          patch_count *= int(dim)
+        pixel_ranges.append((offset, offset + int(patch_count)))
+        offset += int(patch_count)
+      if offset > int(pixel_values.shape[0]):
+        return None
+      index_tensor = torch.tensor(selected_indices, device=image_grid.device, dtype=torch.long)
+      selected_grid = image_grid.index_select(0, index_tensor).contiguous()
+      selected_pixels = torch.cat(
+        [pixel_values[start:end] for start, end in (pixel_ranges[idx] for idx in selected_indices)],
+        dim=0,
+      ).contiguous()
+      visual_start = time.perf_counter()
+      visual = getattr(model_self.vlm, "visual", None)
+      if visual is None:
+        return None
+      image_embeds = visual(selected_pixels, grid_thw=selected_grid)
+      if isinstance(image_embeds, (tuple, list)):
+        image_embeds = image_embeds[0]
+      if image_embeds is None or not hasattr(image_embeds, "shape"):
+        return None
+      split: dict[int, Any] = {}
+      embed_offset = 0
+      for idx in selected_indices:
+        span = spans[idx]
+        token_count = int(span.get("token_count", 0) or 0) if isinstance(span, dict) else 0
+        if token_count <= 0:
+          return None
+        split[idx] = image_embeds[embed_offset : embed_offset + token_count]
+        embed_offset += token_count
+      if embed_offset != int(image_embeds.shape[0]):
+        return None
+      if runtime_profile is not None:
+        runtime_profile["shifted_prompt_kv_visual_fill_image_blocks"] = len(selected_indices)
+        runtime_profile["shifted_prompt_kv_visual_fill_image_patch_tokens"] = int(selected_pixels.shape[0])
+        runtime_profile["shifted_prompt_kv_visual_fill_visual_seconds"] = time.perf_counter() - visual_start
+      return split
+    except Exception as exc:
+      if runtime_profile is not None:
+        runtime_profile["shifted_prompt_kv_visual_fill_error"] = f"{type(exc).__name__}: {exc}"
+      return None
+
+  def _fill_unmatched_visual_prompt_cache(
+    model_self: Any,
+    input_ids: Any,
+    model_kwargs: dict[str, Any],
+    prompt_cache: Any,
+    spans: list[Any],
+    unmatched_spans: list[tuple[int, dict[str, Any]]],
+    *,
+    cache_position_seed: Any,
+    prefill_position_ids: Any,
+    runtime_profile: dict[str, float | int] | None,
+  ) -> bool:
+    def _cache_only_forward(span_kwargs: dict[str, Any], span_inputs_embeds: Any) -> Any | None:
+      try:
+        backbone_only = bool(int(os.environ.get("ALPAMAYO_SHIFTED_KV_VISUAL_FILL_BACKBONE_ONLY", "1")))
+      except Exception:
+        backbone_only = True
+      if backbone_only:
+        backbone = getattr(model_self.vlm, "model", None)
+        if callable(backbone):
+          try:
+            outputs = backbone(
+              input_ids=None,
+              inputs_embeds=span_inputs_embeds,
+              return_dict=True,
+              **span_kwargs,
+            )
+            if getattr(outputs, "past_key_values", None) is not None:
+              if runtime_profile is not None:
+                runtime_profile["shifted_prompt_kv_visual_fill_backbone_only"] = 1
+              return outputs
+          except Exception as exc:
+            if runtime_profile is not None:
+              runtime_profile["shifted_prompt_kv_visual_fill_backbone_error"] = f"{type(exc).__name__}: {exc}"
+      if runtime_profile is not None:
+        runtime_profile["shifted_prompt_kv_visual_fill_backbone_only"] = 0
+      return model_self.vlm(
+        input_ids=None,
+        inputs_embeds=span_inputs_embeds,
+        logits_to_keep=1,
+        return_dict=True,
+        **span_kwargs,
+      )
+
+    if not unmatched_spans:
+      return True
+    start_time = time.perf_counter()
+    filled_tokens = 0
+    selected_indices = [int(span_idx) for span_idx, _span in unmatched_spans]
+    visual_embeds_by_span = _visual_embeds_for_spans(
+      model_self,
+      model_kwargs,
+      spans,
+      selected_indices,
+      runtime_profile=runtime_profile,
+    )
+    if visual_embeds_by_span is None:
+      return False
+    image_token_id = getattr(getattr(model_self.vlm, "config", None), "image_token_id", None)
+    embed_tokens = getattr(model_self.vlm, "get_input_embeddings", lambda: None)()
+    if image_token_id is None or embed_tokens is None:
+      return False
+    try:
+      range_start = min(int(span.get("language_token_start", -1)) for _span_idx, span in unmatched_spans)
+      range_end = max(int(span.get("language_token_end", -1)) for _span_idx, span in unmatched_spans)
+      unmatched_token_total = sum(
+        max(0, int(span.get("language_token_end", 0)) - int(span.get("language_token_start", 0)))
+        for _span_idx, span in unmatched_spans
+      )
+      if range_start >= 0 and range_end > range_start and (range_end - range_start) <= max(32, 2 * int(unmatched_token_total)):
+        range_span_indices: list[int] = []
+        for idx, span in enumerate(spans):
+          if not isinstance(span, dict):
+            continue
+          span_start = int(span.get("language_token_start", -1))
+          span_end = int(span.get("language_token_end", -1))
+          if span_start >= range_start and span_end <= range_end and span_end > span_start:
+            range_span_indices.append(int(idx))
+        range_visual_embeds = _visual_embeds_for_spans(
+          model_self,
+          model_kwargs,
+          spans,
+          range_span_indices,
+          runtime_profile=runtime_profile,
+        )
+        range_prefix_cache = _clone_cache_prefix(
+          model_self,
+          prompt_cache,
+          range_start,
+          runtime_profile=runtime_profile,
+        )
+        if range_visual_embeds is not None and range_prefix_cache is not None:
+          range_ids = input_ids[:, range_start:range_end]
+          range_inputs_embeds = embed_tokens(range_ids).clone()
+          replaced_tokens = 0
+          for span_idx in range_span_indices:
+            span = spans[span_idx]
+            span_start = int(span.get("language_token_start", -1))
+            span_end = int(span.get("language_token_end", -1))
+            span_image_embeds = range_visual_embeds.get(int(span_idx))
+            if span_image_embeds is None:
+              raise ValueError("missing coalesced span image embeddings")
+            local_start = span_start - range_start
+            local_end = span_end - range_start
+            local_ids = range_ids[:, local_start:local_end]
+            image_mask = local_ids == int(image_token_id)
+            if int(image_mask.sum().item()) != int(span_image_embeds.shape[0]):
+              raise ValueError("coalesced span image token count mismatch")
+            range_inputs_embeds[:, local_start:local_end][image_mask] = span_image_embeds.to(
+              device=range_inputs_embeds.device,
+              dtype=range_inputs_embeds.dtype,
+            )
+            replaced_tokens += int(span_image_embeds.shape[0])
+          range_kwargs = dict(model_kwargs)
+          for key in (
+            "pixel_values",
+            "pixel_values_videos",
+            "image_grid_thw",
+            "video_grid_thw",
+            "_openpilot_precomputed_image_features",
+            "_openpilot_precomputed_video_features",
+            "_openpilot_precomputed_patch_pos_embeds",
+            "cache_position_ids",
+            "cache_rope_deltas",
+          ):
+            range_kwargs.pop(key, None)
+          range_kwargs["past_key_values"] = range_prefix_cache
+          range_kwargs["use_cache"] = True
+          range_kwargs["cache_position"] = cache_position_seed[range_start:range_end]
+          if prefill_position_ids is not None:
+            range_kwargs["position_ids"] = prefill_position_ids[..., range_start:range_end]
+          range_outputs = _cache_only_forward(range_kwargs, range_inputs_embeds)
+          if range_outputs is not None and _copy_cache_range(prompt_cache, range_outputs.past_key_values, range_start, range_end):
+            if runtime_profile is not None:
+              runtime_profile["shifted_prompt_kv_visual_fill_coalesced"] = 1
+              runtime_profile["shifted_prompt_kv_visual_fill_coalesced_span_tokens"] = int(range_end - range_start)
+              runtime_profile["shifted_prompt_kv_visual_fill_coalesced_visual_tokens"] = int(replaced_tokens)
+              runtime_profile["shifted_prompt_kv_visual_fill_blocks"] = len(unmatched_spans)
+              runtime_profile["shifted_prompt_kv_visual_fill_tokens"] = int(sum(
+                int(span.get("language_token_end", 0)) - int(span.get("language_token_start", 0))
+                for _span_idx, span in unmatched_spans
+              ))
+              runtime_profile["shifted_prompt_kv_visual_fill_seconds"] = time.perf_counter() - start_time
+            return True
+      elif runtime_profile is not None:
+        runtime_profile["shifted_prompt_kv_visual_fill_coalesced_skipped"] = 1
+        runtime_profile["shifted_prompt_kv_visual_fill_coalesced_span_tokens"] = int(range_end - range_start)
+        runtime_profile["shifted_prompt_kv_visual_fill_coalesced_needed_tokens"] = int(unmatched_token_total)
+    except Exception as exc:
+      if runtime_profile is not None:
+        runtime_profile["shifted_prompt_kv_visual_fill_coalesced_error"] = f"{type(exc).__name__}: {exc}"
+    for span_idx, span in unmatched_spans:
+      span_start = int(span.get("language_token_start", -1))
+      span_end = int(span.get("language_token_end", -1))
+      if span_start < 0 or span_end <= span_start:
+        return False
+      span_prefix_cache = _clone_cache_prefix(
+        model_self,
+        prompt_cache,
+        span_start,
+        runtime_profile=runtime_profile,
+      )
+      if span_prefix_cache is None:
+        return False
+      span_ids = input_ids[:, span_start:span_end]
+      span_image_embeds = visual_embeds_by_span.get(int(span_idx))
+      if span_image_embeds is None:
+        return False
+      span_inputs_embeds = embed_tokens(span_ids).clone()
+      image_mask = span_ids == int(image_token_id)
+      if int(image_mask.sum().item()) != int(span_image_embeds.shape[0]):
+        return False
+      span_inputs_embeds[image_mask] = span_image_embeds.to(
+        device=span_inputs_embeds.device,
+        dtype=span_inputs_embeds.dtype,
+      )
+      span_kwargs = dict(model_kwargs)
+      for key in (
+        "pixel_values",
+        "pixel_values_videos",
+        "image_grid_thw",
+        "video_grid_thw",
+        "_openpilot_precomputed_image_features",
+        "_openpilot_precomputed_video_features",
+        "_openpilot_precomputed_patch_pos_embeds",
+        "cache_position_ids",
+        "cache_rope_deltas",
+      ):
+        span_kwargs.pop(key, None)
+      span_kwargs["past_key_values"] = span_prefix_cache
+      span_kwargs["use_cache"] = True
+      span_kwargs["cache_position"] = cache_position_seed[span_start:span_end]
+      if prefill_position_ids is not None:
+        span_kwargs["position_ids"] = prefill_position_ids[..., span_start:span_end]
+      span_outputs = _cache_only_forward(span_kwargs, span_inputs_embeds)
+      if span_outputs is None:
+        return False
+      if not _copy_cache_range(prompt_cache, span_outputs.past_key_values, span_start, span_end):
+        return False
+      filled_tokens += int(span_end - span_start)
+    if runtime_profile is not None:
+      runtime_profile["shifted_prompt_kv_visual_fill_blocks"] = len(unmatched_spans)
+      runtime_profile["shifted_prompt_kv_visual_fill_tokens"] = int(filled_tokens)
+      runtime_profile["shifted_prompt_kv_visual_fill_seconds"] = time.perf_counter() - start_time
+    return True
+
+  def _try_shifted_visual_prefix_current_suffix(
+    model_self: Any,
+    input_ids: Any,
+    model_kwargs: dict[str, Any],
+    prefix_cache_entry: dict[str, Any],
+    *,
+    max_generation_length: int,
+    eos_token_id: int,
+    cache_position_seed: Any,
+    prefill_position_ids: Any,
+    runtime_profile: dict[str, float | int] | None,
+  ) -> tuple[Any, Any] | None:
+    if int(max_generation_length) != 0 or not isinstance(prefix_cache_entry, dict):
+      return None
+    shifted_plan = prefix_cache_entry.get("streaming_vlm_draft_shifted_prompt_kv_reuse_plan")
+    source_cache = prefix_cache_entry.get("streaming_vlm_shift_source_prompt_cache")
+    spans = prefix_cache_entry.get("language_visual_token_spans")
+    if source_cache is None or not isinstance(shifted_plan, dict) or not shifted_plan.get("valid") or not isinstance(spans, list):
+      return None
+    try:
+      input_seq_len = int(input_ids.shape[1])
+      visual_prefix_end = max(
+        int(span.get("language_token_end", -1))
+        for span in spans
+        if isinstance(span, dict)
+      )
+    except Exception:
+      return None
+    if visual_prefix_end <= 0 or visual_prefix_end >= input_seq_len:
+      return None
+    unmatched_spans = _unmatched_visual_spans(spans, shifted_plan)
+    manual_prefill_start = time.perf_counter()
+    try:
+      tail_prefill_threshold = int(os.environ.get("ALPAMAYO_SHIFTED_KV_TAIL_PREFILL_VISUAL_TOKEN_THRESHOLD", "192"))
+    except Exception:
+      tail_prefill_threshold = 192
+    current_visual_tokens = int(shifted_plan.get("current_visual_language_tokens", 0) or 0)
+    use_tail_prefill = bool(
+      unmatched_spans
+      and tail_prefill_threshold > 0
+      and current_visual_tokens > 0
+      and current_visual_tokens <= tail_prefill_threshold
+    )
+    try:
+      reuse_text_suffix_draft = bool(int(os.environ.get("ALPAMAYO_SHIFTED_KV_REUSE_TEXT_SUFFIX_DRAFT", "0")))
+    except Exception:
+      reuse_text_suffix_draft = False
+    try:
+      skip_new_visual_fill_draft = bool(int(os.environ.get("ALPAMAYO_SHIFTED_KV_SKIP_NEW_VISUAL_FILL_DRAFT", "0")))
+    except Exception:
+      skip_new_visual_fill_draft = False
+    if reuse_text_suffix_draft and unmatched_spans:
+      replay_start = time.perf_counter()
+      replay_prompt_cache = _build_shifted_visual_prefix_cache(
+        model_self,
+        source_cache,
+        shifted_plan,
+        prefix_len=input_seq_len,
+        runtime_profile=runtime_profile,
+      )
+      replay_hit = False
+      if replay_prompt_cache is not None:
+        if skip_new_visual_fill_draft:
+          replay_hit = True
+          if runtime_profile is not None:
+            runtime_profile["shifted_prompt_kv_visual_fill_skipped_draft"] = 1
+            runtime_profile["shifted_prompt_kv_visual_fill_skipped_blocks"] = len(unmatched_spans)
+            runtime_profile["shifted_prompt_kv_visual_fill_skipped_tokens"] = int(sum(
+              max(0, int(span.get("language_token_end", 0) or 0) - int(span.get("language_token_start", 0) or 0))
+              for _span_idx, span in unmatched_spans
+            ))
+            runtime_profile["shifted_prompt_kv_visual_fill_seconds"] = 0.0
+        else:
+          replay_hit = _fill_unmatched_visual_prompt_cache(
+            model_self,
+            input_ids,
+            model_kwargs,
+            replay_prompt_cache,
+            spans,
+            unmatched_spans,
+            cache_position_seed=cache_position_seed,
+            prefill_position_ids=prefill_position_ids,
+            runtime_profile=runtime_profile,
+          )
+      if runtime_profile is not None:
+        runtime_profile["shifted_prompt_kv_text_suffix_replay_requested"] = 1
+        runtime_profile["shifted_prompt_kv_text_suffix_replay_hit"] = int(bool(replay_hit))
+        runtime_profile["shifted_prompt_kv_text_suffix_replay_seconds"] = time.perf_counter() - replay_start
+      if replay_hit:
+        prompt_cache = replay_prompt_cache
+        generated_sequences = input_ids
+        prefix_cache_entry["streaming_vlm_reuse_mode"] = (
+          "shifted_kv_visual_patch_text_suffix_skipfill"
+          if skip_new_visual_fill_draft
+          else "shifted_kv_visual_patch_text_suffix_replay"
+        )
+        prefix_cache_entry["streaming_vlm_reuse_unverified"] = True
+        prefix_cache_entry["full_vlm_generated_sequences"] = generated_sequences.detach().clone()
+        prefix_cache_entry["full_vlm_prompt_cache"] = _stored_prompt_cache_for_shifted_path(prompt_cache, runtime_profile)
+        prefix_cache_entry["full_vlm_prompt_cache_owner"] = (
+          "shifted_visual_patch_text_suffix_skipfill"
+          if skip_new_visual_fill_draft
+          else "shifted_visual_patch_text_suffix_replay"
+        )
+        prefix_cache_entry["full_vlm_window_signature"] = prefix_cache_entry.get(
+          "current_window_signature",
+          prefix_cache_entry.get("window_signature"),
+        )
+        prefix_cache_entry["full_vlm_prompt_cache_context_exact"] = False
+        prefix_cache_entry["full_vlm_max_generation_length"] = int(max_generation_length)
+        prefix_cache_entry["full_vlm_eos_token_id"] = int(eos_token_id)
+        prefix_cache_entry["full_vlm_input_seq_len"] = input_seq_len
+        prefix_cache_entry["full_vlm_reason"] = (
+          "shifted_kv_visual_patch_text_suffix_skipfill_draft"
+          if skip_new_visual_fill_draft
+          else "shifted_kv_visual_patch_text_suffix_replay_draft"
+        )
+        prefix_cache_entry["full_vlm_stores"] = int(prefix_cache_entry.get("full_vlm_stores", 0)) + 1
+        if runtime_profile is not None:
+          runtime_profile["shifted_prompt_kv_current_suffix_hit"] = 1
+          runtime_profile["shifted_prompt_kv_current_suffix_seconds"] = 0.0
+          runtime_profile["shifted_prompt_kv_current_suffix_prefix_len"] = int(input_seq_len)
+          runtime_profile["shifted_prompt_kv_current_suffix_visual_prefix_end"] = int(visual_prefix_end)
+          runtime_profile["shifted_prompt_kv_current_suffix_recompute_reason"] = (
+            "visual_patch_text_suffix_skipfill_draft"
+            if skip_new_visual_fill_draft
+            else "visual_patch_text_suffix_replay_draft"
+          )
+          runtime_profile["shifted_prompt_kv_current_suffix_tokens"] = 0
+          runtime_profile["manual_vlm_prefill_seconds"] = time.perf_counter() - manual_prefill_start
+          runtime_profile["manual_vlm_decode_seconds"] = 0.0
+          runtime_profile["manual_vlm_decode_forwards"] = 0
+          runtime_profile["manual_vlm_generated_tokens"] = 0
+          runtime_profile["manual_vlm_generated_sequences_owner"] = (
+            "shifted_kv_visual_patch_text_suffix_skipfill_input_ids"
+            if skip_new_visual_fill_draft
+            else "shifted_kv_visual_patch_text_suffix_replay_input_ids"
+          )
+          runtime_profile["vlm_full_generation_cache_store"] = 1
+        return generated_sequences, prompt_cache
+    tail_recompute_start = visual_prefix_end
+    if use_tail_prefill:
+      try:
+        tail_recompute_start = min(int(span.get("language_token_start", visual_prefix_end)) for _idx, span in unmatched_spans)
+      except Exception:
+        return None
+      if tail_recompute_start <= 0 or tail_recompute_start >= visual_prefix_end:
+        return None
+      prompt_cache = _build_shifted_visual_prefix_cache(
+        model_self,
+        source_cache,
+        shifted_plan,
+        prefix_len=tail_recompute_start,
+        runtime_profile=runtime_profile,
+      )
+      if prompt_cache is None:
+        return None
+      tail_ids = input_ids[:, tail_recompute_start:visual_prefix_end]
+      tail_kwargs = dict(model_kwargs)
+      if not _select_image_suffix_kwargs(
+        tail_kwargs,
+        spans,
+        recompute_start=tail_recompute_start,
+        runtime_profile=runtime_profile,
+      ):
+        return None
+      tail_kwargs["past_key_values"] = prompt_cache
+      tail_kwargs["use_cache"] = True
+      tail_kwargs["cache_position"] = cache_position_seed[tail_recompute_start:visual_prefix_end]
+      if prefill_position_ids is not None:
+        tail_kwargs["position_ids"] = prefill_position_ids[..., tail_recompute_start:visual_prefix_end]
+      tail_start = time.perf_counter()
+      tail_outputs = model_self.vlm(
+        input_ids=tail_ids,
+        logits_to_keep=1,
+        return_dict=True,
+        **tail_kwargs,
+      )
+      prompt_cache = tail_outputs.past_key_values
+      if runtime_profile is not None:
+        runtime_profile["shifted_prompt_kv_tail_prefill_hit"] = 1
+        runtime_profile["shifted_prompt_kv_tail_prefill_threshold"] = int(tail_prefill_threshold)
+        runtime_profile["shifted_prompt_kv_tail_prefill_current_visual_tokens"] = int(current_visual_tokens)
+        runtime_profile["shifted_prompt_kv_tail_prefill_start"] = int(tail_recompute_start)
+        runtime_profile["shifted_prompt_kv_tail_prefill_tokens"] = int(visual_prefix_end - tail_recompute_start)
+        runtime_profile["shifted_prompt_kv_tail_prefill_seconds"] = time.perf_counter() - tail_start
+    else:
+      prompt_cache = _build_shifted_visual_prefix_cache(
+        model_self,
+        source_cache,
+        shifted_plan,
+        prefix_len=visual_prefix_end,
+        runtime_profile=runtime_profile,
+      )
+      if prompt_cache is None:
+        return None
+      if not _fill_unmatched_visual_prompt_cache(
+        model_self,
+        input_ids,
+        model_kwargs,
+        prompt_cache,
+        spans,
+        unmatched_spans,
+        cache_position_seed=cache_position_seed,
+        prefill_position_ids=prefill_position_ids,
+        runtime_profile=runtime_profile,
+      ):
+        return None
+    suffix_ids = input_ids[:, visual_prefix_end:]
+    suffix_kwargs = dict(model_kwargs)
+    if not _select_image_suffix_kwargs(
+      suffix_kwargs,
+      spans,
+      recompute_start=visual_prefix_end,
+      runtime_profile=runtime_profile,
+    ):
+      return None
+    suffix_kwargs["past_key_values"] = prompt_cache
+    suffix_kwargs["use_cache"] = True
+    suffix_kwargs["cache_position"] = cache_position_seed[visual_prefix_end:input_seq_len]
+    if prefill_position_ids is not None:
+      suffix_kwargs["position_ids"] = prefill_position_ids[..., visual_prefix_end:input_seq_len]
+    start = time.perf_counter()
+    suffix_outputs = model_self.vlm(
+      input_ids=suffix_ids,
+      logits_to_keep=1,
+      return_dict=True,
+      **suffix_kwargs,
+    )
+    prompt_cache = suffix_outputs.past_key_values
+    prefix_cache_entry["streaming_vlm_reuse_mode"] = "shifted_kv_current_state_suffix"
+    prefix_cache_entry["streaming_vlm_reuse_unverified"] = True
+    prefix_cache_entry["full_vlm_generated_sequences"] = input_ids.detach().clone()
+    prefix_cache_entry["full_vlm_prompt_cache"] = _stored_prompt_cache_for_shifted_path(prompt_cache, runtime_profile)
+    prefix_cache_entry["full_vlm_prompt_cache_owner"] = "shifted_visual_prefix_current_state_suffix"
+    prefix_cache_entry["full_vlm_window_signature"] = prefix_cache_entry.get(
+      "current_window_signature",
+      prefix_cache_entry.get("window_signature"),
+    )
+    prefix_cache_entry["full_vlm_prompt_cache_context_exact"] = False
+    prefix_cache_entry["full_vlm_max_generation_length"] = int(max_generation_length)
+    prefix_cache_entry["full_vlm_eos_token_id"] = int(eos_token_id)
+    prefix_cache_entry["full_vlm_input_seq_len"] = input_seq_len
+    prefix_cache_entry["full_vlm_reason"] = (
+      "shifted_kv_current_state_suffix_ready:contiguous_tail_prefill"
+      if use_tail_prefill
+      else "shifted_kv_current_state_suffix_ready:sparse_visual_fill"
+    )
+    prefix_cache_entry["full_vlm_stores"] = int(prefix_cache_entry.get("full_vlm_stores", 0)) + 1
+    if runtime_profile is not None:
+      runtime_profile["shifted_prompt_kv_current_suffix_hit"] = 1
+      runtime_profile["shifted_prompt_kv_current_suffix_seconds"] = time.perf_counter() - start
+      runtime_profile["shifted_prompt_kv_current_suffix_prefix_len"] = int(visual_prefix_end)
+      runtime_profile["shifted_prompt_kv_current_suffix_visual_prefix_end"] = int(visual_prefix_end)
+      runtime_profile["shifted_prompt_kv_current_suffix_recompute_reason"] = (
+        "contiguous_tail_prefill" if use_tail_prefill else "sparse_visual_fill"
+      )
+      runtime_profile["shifted_prompt_kv_current_suffix_tokens"] = int(input_seq_len - visual_prefix_end)
+      runtime_profile["manual_vlm_prefill_seconds"] = time.perf_counter() - manual_prefill_start
+      runtime_profile["manual_vlm_decode_seconds"] = 0.0
+      runtime_profile["manual_vlm_decode_forwards"] = 0
+      runtime_profile["manual_vlm_generated_tokens"] = 0
+      runtime_profile["manual_vlm_generated_sequences_owner"] = "shifted_kv_current_state_suffix_input_ids"
+      runtime_profile["vlm_full_generation_cache_store"] = 1
+    return input_ids, prompt_cache
 
   def manual_greedy_vlm_generate(
     self: Any,
@@ -1173,6 +2216,60 @@ def _patch_manual_greedy_generation() -> None:
       and int(prefix_cache_entry.get("full_vlm_eos_token_id", -1)) == int(eos_token_id)
       and int(prefix_cache_entry.get("full_vlm_input_seq_len", -1)) == int(input_ids.shape[1])
     )
+    if full_generation_usable and isinstance(prefix_cache_entry, dict):
+      exact_window_full_hit = bool(
+        prefix_cache_entry.get("current_window_full_hit")
+        or prefix_cache_entry.get("exact_window_full_hit")
+        or prefix_cache_entry.get("window_full_hit")
+      )
+      streaming_reuse_mode = str(prefix_cache_entry.get("streaming_vlm_reuse_mode", ""))
+      streaming_reuse_unverified = bool(prefix_cache_entry.get("streaming_vlm_reuse_unverified")) or streaming_reuse_mode.endswith("_unverified")
+      trusted_replay_requested = bool(prefix_cache_entry.get("streaming_vlm_trusted_replay_requested"))
+      trusted_no_reasoning_replay = bool(
+        prefix_cache_entry.get("streaming_vlm_trusted_replay_allowed")
+        and int(max_generation_length) == 0
+      )
+      (
+        exact_current_window_generation,
+        generation_window_signature_match,
+        prompt_cache_context_exact,
+      ) = _full_generation_exact_current_window(prefix_cache_entry)
+      if runtime_profile is not None:
+        runtime_profile["vlm_full_generation_cache_window_signature_match"] = (
+          1 if generation_window_signature_match else 0
+        )
+        runtime_profile["vlm_full_generation_prompt_cache_context_exact"] = (
+          1 if prompt_cache_context_exact else 0
+        )
+      if (
+        not trusted_no_reasoning_replay
+        and (streaming_reuse_unverified or not exact_window_full_hit or not exact_current_window_generation)
+      ):
+        full_generation_usable = False
+        if streaming_reuse_unverified:
+          prefix_cache_entry["full_vlm_reason"] = "disabled_for_unverified_streaming_current_prompt_freshness"
+        elif not exact_window_full_hit:
+          prefix_cache_entry["full_vlm_reason"] = "disabled_without_exact_window_hit"
+        elif not generation_window_signature_match:
+          prefix_cache_entry["full_vlm_reason"] = "disabled_without_exact_generation_window_signature"
+        else:
+          prefix_cache_entry["full_vlm_reason"] = "disabled_without_exact_prompt_cache_context"
+        if runtime_profile is not None:
+          runtime_profile["vlm_full_generation_cache_disabled_for_streaming"] = 1 if streaming_reuse_unverified else 0
+          runtime_profile["vlm_full_generation_cache_disabled_without_exact_window_hit"] = 0 if exact_window_full_hit else 1
+          runtime_profile["vlm_full_generation_cache_disabled_without_exact_window_signature"] = (
+            0 if generation_window_signature_match else 1
+          )
+          runtime_profile["vlm_full_generation_cache_disabled_without_exact_prompt_cache_context"] = (
+            0 if prompt_cache_context_exact else 1
+          )
+          runtime_profile["vlm_full_generation_cache_trusted_replay_disabled_for_diffusion_freshness"] = (
+            1 if trusted_replay_requested or bool(prefix_cache_entry.get("streaming_vlm_trusted_replay_allowed")) else 0
+          )
+      elif trusted_no_reasoning_replay and runtime_profile is not None:
+        runtime_profile["vlm_full_generation_cache_trusted_replay_no_reasoning"] = 1
+        runtime_profile["vlm_full_generation_cache_disabled_for_streaming"] = 0
+        runtime_profile["vlm_full_generation_cache_trusted_replay_disabled_for_diffusion_freshness"] = 0
     if (
       isinstance(prefix_cache_entry, dict)
       and full_generation_usable
@@ -1204,6 +2301,20 @@ def _patch_manual_greedy_generation() -> None:
         prefix_cache_entry["full_vlm_reason"] = f"full_generation_cache_copy_failed:{type(exc).__name__}"
         if runtime_profile is not None:
           runtime_profile["vlm_full_generation_cache_copy_error"] = f"{type(exc).__name__}: {exc}"
+    if isinstance(prefix_cache_entry, dict) and int(max_generation_length) == 0:
+      shifted_suffix_result = _try_shifted_visual_prefix_current_suffix(
+        self,
+        input_ids,
+        model_kwargs,
+        prefix_cache_entry,
+        max_generation_length=int(max_generation_length),
+        eos_token_id=int(eos_token_id),
+        cache_position_seed=cache_position_seed,
+        prefill_position_ids=prefill_position_ids,
+        runtime_profile=runtime_profile,
+      )
+      if shifted_suffix_result is not None:
+        return shifted_suffix_result
     if isinstance(prefix_cache_entry, dict) and prefix_cache_entry.get("streaming_vlm_draft_generated_sequences") is not None:
       draft_start = time.perf_counter()
       try:
@@ -1295,9 +2406,16 @@ def _patch_manual_greedy_generation() -> None:
           generated_sequences = verify_inputs
           generated_sequence_len = verify_sequence_len
           prefix_cache_entry["streaming_vlm_draft_reason"] = "verify_accepted"
+          prefix_cache_entry["streaming_vlm_reuse_unverified"] = False
+          prefix_cache_entry["streaming_vlm_reuse_mode"] = "draft_verify"
           prefix_cache_entry["full_vlm_generated_sequences"] = generated_sequences.detach().clone()
           prefix_cache_entry["full_vlm_prompt_cache"] = copy.deepcopy(prompt_cache)
           prefix_cache_entry["full_vlm_prompt_cache_owner"] = "streaming_draft_verified_current_prompt_cache"
+          prefix_cache_entry["full_vlm_window_signature"] = prefix_cache_entry.get(
+            "current_window_signature",
+            prefix_cache_entry.get("window_signature"),
+          )
+          prefix_cache_entry["full_vlm_prompt_cache_context_exact"] = True
           prefix_cache_entry["full_vlm_max_generation_length"] = int(max_generation_length)
           prefix_cache_entry["full_vlm_eos_token_id"] = int(eos_token_id)
           prefix_cache_entry["full_vlm_input_seq_len"] = int(input_ids.shape[1])
@@ -1525,6 +2643,11 @@ def _patch_manual_greedy_generation() -> None:
         prefix_cache_entry["full_vlm_generated_sequences"] = generated_sequences.detach().clone()
         prefix_cache_entry["full_vlm_prompt_cache"] = copy.deepcopy(prompt_cache)
         prefix_cache_entry["full_vlm_prompt_cache_owner"] = "prefix_cache_full_generation_stored_immutable_copy"
+        prefix_cache_entry["full_vlm_window_signature"] = prefix_cache_entry.get(
+          "current_window_signature",
+          prefix_cache_entry.get("window_signature"),
+        )
+        prefix_cache_entry["full_vlm_prompt_cache_context_exact"] = True
         prefix_cache_entry["full_vlm_max_generation_length"] = int(max_generation_length)
         prefix_cache_entry["full_vlm_eos_token_id"] = int(eos_token_id)
         prefix_cache_entry["full_vlm_input_seq_len"] = int(input_ids.shape[1])
@@ -2655,6 +3778,7 @@ class LocalAlpamayoAdapter:
       _freeze_cache_key_value(window_signature),
       _freeze_cache_key_value(tokenized_signature),
       _freeze_cache_key_value(token_content_signature),
+      _freeze_cache_key_value(tokenized_data.get("_openpilot_fused_input_ids_signature", ())),
     )
 
   def _language_visual_token_spans(
@@ -2859,11 +3983,67 @@ class LocalAlpamayoAdapter:
 
   def _vlm_prefix_entry_full_generation_ready(self, entry: dict[str, Any], input_seq_len: int) -> bool:
     try:
+      if self.config.disable_reasoning_generation and self._require_state_fresh_no_reasoning():
+        entry["full_vlm_state_fresh_no_reasoning_forced_prefill"] = True
+        return False
       if entry.get("full_vlm_generated_sequences") is None or entry.get("full_vlm_prompt_cache") is None:
         return False
-      if self.config.streaming_vlm_trust_shifted_draft and bool(entry.get("streaming_vlm_reuse_unverified")):
-        return True
-      return int(entry.get("full_vlm_input_seq_len", -1)) == int(input_seq_len)
+      if int(entry.get("full_vlm_input_seq_len", -1)) != int(input_seq_len):
+        return False
+      trusted_no_reasoning_replay = bool(
+        self.config.disable_reasoning_generation
+        and self.config.no_reasoning_trust_shifted_prompt_cache
+        and not self._require_state_fresh_no_reasoning()
+        and entry.get("streaming_vlm_trusted_replay_allowed")
+      )
+      source_window_signature = entry.get("window_signature")
+      generation_window_signature = entry.get("full_vlm_window_signature")
+      if (
+        source_window_signature is None
+        or generation_window_signature is None
+        or generation_window_signature != source_window_signature
+      ) and not trusted_no_reasoning_replay:
+        return False
+      if not bool(entry.get("full_vlm_prompt_cache_context_exact")) and not trusted_no_reasoning_replay:
+        return False
+      if bool(entry.get("streaming_vlm_reuse_unverified")) and not trusted_no_reasoning_replay:
+        return False
+      return True
+    except Exception:
+      return False
+
+  def _vlm_prefix_entry_draft_source_ready(self, entry: dict[str, Any], input_seq_len: int) -> bool:
+    try:
+      if entry.get("full_vlm_generated_sequences") is None or entry.get("full_vlm_prompt_cache") is None:
+        return False
+      if int(entry.get("full_vlm_input_seq_len", -1)) != int(input_seq_len):
+        return False
+      if bool(entry.get("streaming_vlm_reuse_unverified")) and not self.config.streaming_vlm_trust_shifted_draft:
+        return False
+      return True
+    except Exception:
+      return False
+
+  @staticmethod
+  def _dflash_prefix_entry_full_generation_ready(entry: dict[str, Any], input_seq_len: int) -> bool:
+    try:
+      if entry.get("dflash_full_generated_sequences") is None or entry.get("dflash_full_prompt_cache") is None:
+        return False
+      if int(entry.get("dflash_full_input_seq_len", -1)) != int(input_seq_len):
+        return False
+      source_window_signature = entry.get("window_signature")
+      generation_window_signature = entry.get("dflash_full_window_signature")
+      if (
+        source_window_signature is None
+        or generation_window_signature is None
+        or generation_window_signature != source_window_signature
+      ):
+        return False
+      if not bool(entry.get("dflash_full_prompt_cache_context_exact")):
+        return False
+      if bool(entry.get("streaming_vlm_reuse_unverified")):
+        return False
+      return True
     except Exception:
       return False
 
@@ -2886,13 +4066,13 @@ class LocalAlpamayoAdapter:
     for source_key, source_entry in reversed(self._vlm_prefix_cache.items()):
       if not isinstance(source_entry, dict):
         continue
-      if not self._vlm_prefix_entry_full_generation_ready(source_entry, input_seq_len):
+      if not self._vlm_prefix_entry_draft_source_ready(source_entry, input_seq_len):
         continue
       try:
         chain_depth = int(source_entry.get("streaming_vlm_reuse_chain_depth", 0) or 0)
       except Exception:
         chain_depth = 0
-      if max_chain > 0 and chain_depth >= max_chain:
+      if max_chain > 0 and chain_depth >= max_chain and not self.config.streaming_vlm_trust_shifted_draft:
         continue
       overlap, total, ratio = self._window_suffix_prefix_overlap(
         source_entry.get("window_signature"),
@@ -2926,7 +4106,7 @@ class LocalAlpamayoAdapter:
           for source_key, source_entry in reversed(self._vlm_prefix_cache.items()):
             if not isinstance(source_entry, dict):
               continue
-            if self._vlm_prefix_entry_full_generation_ready(source_entry, input_seq_len):
+            if self._vlm_prefix_entry_draft_source_ready(source_entry, input_seq_len):
               source_entry["_streaming_vlm_candidate_overlap_source"] = "vision_cache_retained_frames"
               return source_key, source_entry, overlap, total, ratio
     return None
@@ -2971,6 +4151,7 @@ class LocalAlpamayoAdapter:
       "visual_token_blocks": visual_token_blocks,
       "language_visual_token_spans": language_visual_token_spans,
       "prefix_semantic_signature": tokenized_data.get("_openpilot_prefix_semantic_signature"),
+      "fused_input_ids_signature": tokenized_data.get("_openpilot_fused_input_ids_signature", ()),
       "cache_position_ids_signature": _tensor_tree_signature(
         self._torch,
         tokenized_data.get("cache_position_ids"),
@@ -2980,9 +4161,10 @@ class LocalAlpamayoAdapter:
         tokenized_data.get("cache_rope_deltas"),
       ) if self._torch is not None and tokenized_data.get("cache_rope_deltas") is not None else (),
     }
+    force_vlm_refresh = bool(getattr(self, "_openpilot_force_vlm_refresh", False))
     with self._cache_lock:
       cached = self._vlm_prefix_cache.get(key)
-      if cached is not None:
+      if cached is not None and not force_vlm_refresh:
         self._vlm_prefix_cache.move_to_end(key)
         cached["hits"] = int(cached.get("hits", 0)) + 1
         if self._model is not None:
@@ -3001,13 +4183,17 @@ class LocalAlpamayoAdapter:
           "dflashReason": str(cached.get("dflash_reason", "")),
           "dflashHits": int(cached.get("dflash_hits", 0)),
           "dflashStores": int(cached.get("dflash_stores", 0)),
-          "dflashFullGenerationReady": cached.get("dflash_full_generated_sequences") is not None
-          and cached.get("dflash_full_prompt_cache") is not None,
+          "dflashFullGenerationReady": self._dflash_prefix_entry_full_generation_ready(
+            cached,
+            int(entry["input_seq_len"]),
+          ),
           "dflashFullGenerationReason": str(cached.get("dflash_full_reason", "")),
           "dflashFullGenerationHits": int(cached.get("dflash_full_hits", 0)),
           "dflashFullGenerationStores": int(cached.get("dflash_full_stores", 0)),
-          "fullGenerationReady": cached.get("full_vlm_generated_sequences") is not None
-          and cached.get("full_vlm_prompt_cache") is not None,
+          "fullGenerationReady": self._vlm_prefix_entry_full_generation_ready(
+            cached,
+            int(entry["input_seq_len"]),
+          ),
           "fullGenerationReason": str(cached.get("full_vlm_reason", "")),
           "fullGenerationHits": int(cached.get("full_vlm_hits", 0)),
           "fullGenerationStores": int(cached.get("full_vlm_stores", 0)),
@@ -3019,15 +4205,20 @@ class LocalAlpamayoAdapter:
           "streamingReuseChainDepth": int(cached.get("streaming_vlm_reuse_chain_depth", 0) or 0),
           "streamingReuseMode": str(cached.get("streaming_vlm_reuse_mode", "")),
           "streamingReuseUnverified": bool(cached.get("streaming_vlm_reuse_unverified")),
+          "trustedReplayAllowed": bool(cached.get("streaming_vlm_trusted_replay_allowed")),
           "languageVisualTokenSpans": len(cached.get("language_visual_token_spans", []) or []),
           "shiftedPromptKvReusePlan": cached.get("streaming_vlm_draft_shifted_prompt_kv_reuse_plan", {}),
         }
         return
-      reuse_candidate = self._streaming_vlm_prefix_reuse_candidate(
-        window_signature=window_signature,
-        input_seq_len=int(entry["input_seq_len"]),
-        cache_stats=cache_stats,
-      )
+      if force_vlm_refresh:
+        reuse_candidate = None
+        cache_stats["vlm_prefix_force_refresh"] = 1
+      else:
+        reuse_candidate = self._streaming_vlm_prefix_reuse_candidate(
+          window_signature=window_signature,
+          input_seq_len=int(entry["input_seq_len"]),
+          cache_stats=cache_stats,
+        )
       if reuse_candidate is not None:
         source_key, source_entry, overlap_frames, total_frames, overlap_ratio = reuse_candidate
         overlap_source = str(source_entry.pop("_streaming_vlm_candidate_overlap_source", "window_signature"))
@@ -3035,78 +4226,110 @@ class LocalAlpamayoAdapter:
           source_chain_depth = int(source_entry.get("streaming_vlm_reuse_chain_depth", 0) or 0)
         except Exception:
           source_chain_depth = 0
-        if self.config.streaming_vlm_trust_shifted_draft:
-          entry.update({
-            "has_prompt_cache": True,
-            "reason": "streaming_shift_trusted_full_generation_reuse",
-            "full_vlm_generated_sequences": source_entry.get("full_vlm_generated_sequences"),
-            "full_vlm_prompt_cache": source_entry.get("full_vlm_prompt_cache"),
-            "full_vlm_prompt_cache_owner": "streaming_shift_trusted_reused_prompt_cache",
-            "full_vlm_max_generation_length": int(source_entry.get("full_vlm_max_generation_length", -1)),
-            "full_vlm_eos_token_id": int(source_entry.get("full_vlm_eos_token_id", -1)),
-            "full_vlm_input_seq_len": int(entry["input_seq_len"]),
-            "full_vlm_reason": f"streaming_shift_trusted_reuse_ready:{overlap_frames}/{total_frames}",
-            "full_vlm_hits": 0,
-            "full_vlm_stores": 0,
-            "streaming_vlm_reuse": True,
-            "streaming_vlm_reuse_mode": "trusted_full_generation_replay",
-            "streaming_vlm_reuse_unverified": True,
-            "streaming_vlm_reuse_source_key": repr(source_key)[:512],
-            "streaming_vlm_reuse_overlap_ratio": float(overlap_ratio),
-            "streaming_vlm_reuse_overlap_frames": int(overlap_frames),
-            "streaming_vlm_reuse_total_frames": int(total_frames),
-            "streaming_vlm_reuse_overlap_source": overlap_source,
-            "streaming_vlm_reuse_chain_depth": source_chain_depth + 1,
-          })
-        else:
-          source_cache_context_match = bool(
-            source_entry.get("window_signature") == window_signature
-            and source_entry.get("prefix_semantic_signature") == entry.get("prefix_semantic_signature")
-            and source_entry.get("cache_position_ids_signature") == entry.get("cache_position_ids_signature")
-            and source_entry.get("cache_rope_deltas_signature") == entry.get("cache_rope_deltas_signature")
-          )
-          shifted_prompt_kv_reuse_plan = self._shifted_prompt_kv_reuse_plan(
-            source_entry.get("language_visual_token_spans", []),
-            entry.get("language_visual_token_spans", []),
-          )
-          shifted_prompt_kv_reuse_plan = self._validate_shifted_prompt_kv_reuse_plan(
-            shifted_prompt_kv_reuse_plan,
-            source_input_seq_len=int(source_entry.get("input_seq_len", source_entry.get("full_vlm_input_seq_len", 0)) or 0),
-            current_input_seq_len=int(entry.get("input_seq_len", 0) or 0),
-          )
-          entry.update({
-            "has_prompt_cache": False,
-            "reason": "streaming_shift_draft_ready",
-            "streaming_vlm_draft_generated_sequences": source_entry.get("full_vlm_generated_sequences"),
-            "streaming_vlm_draft_max_generation_length": int(source_entry.get("full_vlm_max_generation_length", -1)),
-            "streaming_vlm_draft_eos_token_id": int(source_entry.get("full_vlm_eos_token_id", -1)),
-            "streaming_vlm_draft_input_seq_len": int(source_entry.get("full_vlm_input_seq_len", entry["input_seq_len"])),
-            "streaming_vlm_draft_source_window_signature": source_entry.get("window_signature"),
-            "streaming_vlm_draft_source_prefix_semantic_signature": source_entry.get("prefix_semantic_signature"),
-            "streaming_vlm_draft_source_cache_position_ids_signature": source_entry.get("cache_position_ids_signature"),
-            "streaming_vlm_draft_source_cache_rope_deltas_signature": source_entry.get("cache_rope_deltas_signature"),
-            "streaming_vlm_draft_source_cache_context_match": source_cache_context_match,
-            "streaming_vlm_draft_shifted_prompt_kv_reuse_plan": shifted_prompt_kv_reuse_plan,
-            "streaming_vlm_draft_dflash_layer_ids": tuple(source_entry.get("dflash_layer_ids", ())),
-            "streaming_vlm_draft_dflash_target_cache": copy.deepcopy(source_entry.get("dflash_target_cache")),
-            "streaming_vlm_draft_dflash_prefill_logits": self._detach_clone_tensor_tree(
-              source_entry.get("dflash_prefill_logits")
-            ),
-            "streaming_vlm_draft_dflash_target_hidden": self._detach_clone_tensor_tree(
-              source_entry.get("dflash_target_hidden")
-            ),
-            "full_vlm_reason": f"streaming_shift_draft_pending_verify:{overlap_frames}/{total_frames}",
-            "full_vlm_hits": 0,
-            "full_vlm_stores": 0,
-            "streaming_vlm_reuse": True,
-            "streaming_vlm_reuse_mode": "draft_verify",
-            "streaming_vlm_reuse_source_key": repr(source_key)[:512],
-            "streaming_vlm_reuse_overlap_ratio": float(overlap_ratio),
-            "streaming_vlm_reuse_overlap_frames": int(overlap_frames),
-            "streaming_vlm_reuse_total_frames": int(total_frames),
-            "streaming_vlm_reuse_overlap_source": overlap_source,
-            "streaming_vlm_reuse_chain_depth": source_chain_depth + 1,
-          })
+        refresh_interval = max(0, int(self.config.streaming_vlm_trusted_replay_refresh_interval))
+        refresh_due = bool(refresh_interval > 0 and source_chain_depth + 1 >= refresh_interval)
+        trusted_replay_requested = bool(
+          self.config.streaming_vlm_trust_shifted_draft
+          and source_entry.get("full_vlm_generated_sequences") is not None
+          and source_entry.get("full_vlm_prompt_cache") is not None
+        )
+        source_cache_context_match = bool(
+          source_entry.get("window_signature") == window_signature
+          and source_entry.get("prefix_semantic_signature") == entry.get("prefix_semantic_signature")
+          and source_entry.get("fused_input_ids_signature", ()) == entry.get("fused_input_ids_signature", ())
+          and source_entry.get("cache_position_ids_signature") == entry.get("cache_position_ids_signature")
+          and source_entry.get("cache_rope_deltas_signature") == entry.get("cache_rope_deltas_signature")
+        )
+        shifted_prompt_kv_reuse_plan = self._shifted_prompt_kv_reuse_plan(
+          source_entry.get("language_visual_token_spans", []),
+          entry.get("language_visual_token_spans", []),
+        )
+        shifted_prompt_kv_reuse_plan = self._validate_shifted_prompt_kv_reuse_plan(
+          shifted_prompt_kv_reuse_plan,
+          source_input_seq_len=int(source_entry.get("input_seq_len", source_entry.get("full_vlm_input_seq_len", 0)) or 0),
+          current_input_seq_len=int(entry.get("input_seq_len", 0) or 0),
+        )
+        shifted_prompt_kv_retained_ratio = (
+          float(shifted_prompt_kv_reuse_plan.get("validated_retained_ratio", shifted_prompt_kv_reuse_plan.get("retained_ratio", 0.0)) or 0.0)
+          if isinstance(shifted_prompt_kv_reuse_plan, dict)
+          else 0.0
+        )
+        no_reasoning_trusted_replay_allowed = bool(
+          self.config.disable_reasoning_generation
+          and self.config.no_reasoning_trust_shifted_prompt_cache
+          and not self._require_state_fresh_no_reasoning()
+          and trusted_replay_requested
+          and int(source_entry.get("full_vlm_max_generation_length", -1)) == 0
+          and int(source_entry.get("full_vlm_input_seq_len", -1)) == int(entry["input_seq_len"])
+          and isinstance(shifted_prompt_kv_reuse_plan, dict)
+          and shifted_prompt_kv_reuse_plan.get("valid")
+          and shifted_prompt_kv_retained_ratio >= max(0.0, min(1.0, float(self.config.streaming_vlm_prefix_reuse_min_overlap)))
+        )
+        entry.update({
+          "has_prompt_cache": False,
+          "reason": (
+            "streaming_shift_trusted_full_replay_no_reasoning"
+            if no_reasoning_trusted_replay_allowed
+            else (
+              "streaming_shift_trusted_draft_verify_ready"
+              if self.config.streaming_vlm_trust_shifted_draft
+              else "streaming_shift_draft_ready"
+            )
+          ),
+          "full_vlm_generated_sequences": source_entry.get("full_vlm_generated_sequences") if no_reasoning_trusted_replay_allowed else None,
+          "full_vlm_prompt_cache": source_entry.get("full_vlm_prompt_cache") if no_reasoning_trusted_replay_allowed else None,
+          "full_vlm_prompt_cache_owner": "trusted_shifted_source_prompt_cache_no_reasoning" if no_reasoning_trusted_replay_allowed else "",
+          "full_vlm_window_signature": source_entry.get("full_vlm_window_signature") if no_reasoning_trusted_replay_allowed else None,
+          "full_vlm_prompt_cache_context_exact": bool(source_cache_context_match),
+          "full_vlm_max_generation_length": int(source_entry.get("full_vlm_max_generation_length", -1)) if no_reasoning_trusted_replay_allowed else -1,
+          "full_vlm_eos_token_id": int(source_entry.get("full_vlm_eos_token_id", -1)) if no_reasoning_trusted_replay_allowed else -1,
+          "full_vlm_input_seq_len": int(entry["input_seq_len"]) if no_reasoning_trusted_replay_allowed else -1,
+          "streaming_vlm_draft_generated_sequences": source_entry.get("full_vlm_generated_sequences"),
+          "streaming_vlm_draft_max_generation_length": int(source_entry.get("full_vlm_max_generation_length", -1)),
+          "streaming_vlm_draft_eos_token_id": int(source_entry.get("full_vlm_eos_token_id", -1)),
+          "streaming_vlm_draft_input_seq_len": int(source_entry.get("full_vlm_input_seq_len", entry["input_seq_len"])),
+          "streaming_vlm_draft_source_window_signature": source_entry.get("window_signature"),
+          "streaming_vlm_draft_source_prefix_semantic_signature": source_entry.get("prefix_semantic_signature"),
+          "streaming_vlm_draft_source_fused_input_ids_signature": source_entry.get("fused_input_ids_signature", ()),
+          "streaming_vlm_draft_source_cache_position_ids_signature": source_entry.get("cache_position_ids_signature"),
+          "streaming_vlm_draft_source_cache_rope_deltas_signature": source_entry.get("cache_rope_deltas_signature"),
+          "streaming_vlm_draft_source_cache_context_match": source_cache_context_match,
+          "streaming_vlm_draft_shifted_prompt_kv_reuse_plan": shifted_prompt_kv_reuse_plan,
+          "streaming_vlm_shift_source_prompt_cache": source_entry.get("full_vlm_prompt_cache"),
+          "streaming_vlm_shift_source_generated_sequences": source_entry.get("full_vlm_generated_sequences"),
+          "streaming_vlm_draft_dflash_layer_ids": tuple(source_entry.get("dflash_layer_ids", ())),
+          "streaming_vlm_draft_dflash_target_cache": copy.deepcopy(source_entry.get("dflash_target_cache")),
+          "streaming_vlm_draft_dflash_prefill_logits": self._detach_clone_tensor_tree(
+            source_entry.get("dflash_prefill_logits")
+          ),
+          "streaming_vlm_draft_dflash_target_hidden": self._detach_clone_tensor_tree(
+            source_entry.get("dflash_target_hidden")
+          ),
+          "full_vlm_reason": (
+            f"trusted_shifted_prompt_cache_replay_no_reasoning:{overlap_frames}/{total_frames}"
+            if no_reasoning_trusted_replay_allowed
+            else f"streaming_shift_draft_pending_verify:{overlap_frames}/{total_frames}"
+          ),
+          "full_vlm_hits": 0,
+          "full_vlm_stores": 1 if no_reasoning_trusted_replay_allowed else 0,
+          "streaming_vlm_reuse": True,
+          "streaming_vlm_reuse_mode": "trusted_full_replay_no_reasoning" if no_reasoning_trusted_replay_allowed else "draft_verify",
+          "streaming_vlm_reuse_unverified": not source_cache_context_match,
+          "streaming_vlm_trusted_replay_requested": trusted_replay_requested,
+          "streaming_vlm_trusted_replay_allowed": no_reasoning_trusted_replay_allowed,
+          "streaming_vlm_trusted_replay_disabled_for_diffusion_freshness": trusted_replay_requested and not no_reasoning_trusted_replay_allowed,
+          "streaming_vlm_state_fresh_no_reasoning_required": bool(
+            self.config.disable_reasoning_generation and self._require_state_fresh_no_reasoning()
+          ),
+          "streaming_vlm_trusted_replay_refresh_interval": int(refresh_interval),
+          "streaming_vlm_refresh_due": bool(refresh_due and trusted_replay_requested),
+          "streaming_vlm_reuse_source_key": repr(source_key)[:512],
+          "streaming_vlm_reuse_overlap_ratio": float(overlap_ratio),
+          "streaming_vlm_reuse_overlap_frames": int(overlap_frames),
+          "streaming_vlm_reuse_total_frames": int(total_frames),
+          "streaming_vlm_reuse_overlap_source": overlap_source,
+          "streaming_vlm_reuse_chain_depth": source_chain_depth + 1,
+        })
         source_entry["streaming_vlm_reuse_exports"] = int(source_entry.get("streaming_vlm_reuse_exports", 0) or 0) + 1
       self._vlm_prefix_cache[key] = entry
       self._vlm_prefix_cache.move_to_end(key)
@@ -3132,8 +4355,10 @@ class LocalAlpamayoAdapter:
         "dflashFullGenerationReason": "",
         "dflashFullGenerationHits": 0,
         "dflashFullGenerationStores": 0,
-        "fullGenerationReady": entry.get("full_vlm_generated_sequences") is not None
-        and entry.get("full_vlm_prompt_cache") is not None,
+        "fullGenerationReady": self._vlm_prefix_entry_full_generation_ready(
+          entry,
+          int(entry["input_seq_len"]),
+        ),
         "fullGenerationReason": str(entry.get("full_vlm_reason", "")),
         "fullGenerationHits": 0,
         "fullGenerationStores": 0,
@@ -3146,7 +4371,11 @@ class LocalAlpamayoAdapter:
         "streamingReuseChainDepth": int(entry.get("streaming_vlm_reuse_chain_depth", 0) or 0),
         "streamingReuseMode": str(entry.get("streaming_vlm_reuse_mode", "")),
         "streamingReuseUnverified": bool(entry.get("streaming_vlm_reuse_unverified")),
-        "languageVisualTokenSpans": len(entry.get("language_visual_token_spans", []) or []),
+          "trustedReplayAllowed": bool(entry.get("streaming_vlm_trusted_replay_allowed")),
+          "stateFreshNoReasoningRequired": bool(entry.get("streaming_vlm_state_fresh_no_reasoning_required")),
+          "stateFreshNoReasoningForcedPrefill": bool(entry.get("full_vlm_state_fresh_no_reasoning_forced_prefill")),
+          "refreshDue": bool(entry.get("streaming_vlm_refresh_due")),
+          "languageVisualTokenSpans": len(entry.get("language_visual_token_spans", []) or []),
         "shiftedPromptKvReusePlan": entry.get("streaming_vlm_draft_shifted_prompt_kv_reuse_plan", {}),
       }
 
@@ -3922,6 +5151,20 @@ class LocalAlpamayoAdapter:
         max_generation_length: int,
         runtime_profile: dict[str, float | int] | None = None,
       ) -> tuple[Any, Any]:
+        if adapter.config.disable_reasoning_generation or int(max_generation_length) <= 0:
+          base_generate = adapter._dflash_original_manual_generate
+          if base_generate is None:
+            raise RuntimeError("base manual VLM prefill path unavailable for no-reasoning Alpamayo")
+          if runtime_profile is not None:
+            runtime_profile["dflash_no_reasoning_bypass"] = 1
+            runtime_profile["vlm_autoregressive_generation_skipped"] = 1
+          return base_generate(
+            input_ids=input_ids,
+            tokenized_data=tokenized_data,
+            eos_token_id=eos_token_id,
+            max_generation_length=0,
+            runtime_profile=runtime_profile,
+          )
         if adapter._dflash_model is None or adapter._dflash_mask_embedding is None:
           raise RuntimeError("DFlash generation requested before draft model was loaded")
         prefix_cache_entry = getattr(model_self, "_openpilot_vlm_prefix_cache_entry", None)
@@ -3933,6 +5176,49 @@ class LocalAlpamayoAdapter:
           and int(prefix_cache_entry.get("full_vlm_eos_token_id", -1)) == int(eos_token_id)
           and int(prefix_cache_entry.get("full_vlm_input_seq_len", -1)) == int(input_ids.shape[1])
         )
+        if full_generation_usable and isinstance(prefix_cache_entry, dict):
+          exact_window_full_hit = bool(
+            prefix_cache_entry.get("current_window_full_hit")
+            or prefix_cache_entry.get("exact_window_full_hit")
+            or prefix_cache_entry.get("window_full_hit")
+          )
+          streaming_reuse_mode = str(prefix_cache_entry.get("streaming_vlm_reuse_mode", ""))
+          streaming_reuse_unverified = bool(prefix_cache_entry.get("streaming_vlm_reuse_unverified")) or streaming_reuse_mode.endswith("_unverified")
+          trusted_replay_requested = bool(prefix_cache_entry.get("streaming_vlm_trusted_replay_requested"))
+          (
+            exact_current_window_generation,
+            generation_window_signature_match,
+            prompt_cache_context_exact,
+          ) = _full_generation_exact_current_window(prefix_cache_entry)
+          if runtime_profile is not None:
+            runtime_profile["vlm_full_generation_cache_window_signature_match"] = (
+              1 if generation_window_signature_match else 0
+            )
+            runtime_profile["vlm_full_generation_prompt_cache_context_exact"] = (
+              1 if prompt_cache_context_exact else 0
+            )
+          if streaming_reuse_unverified or not exact_window_full_hit or not exact_current_window_generation:
+            full_generation_usable = False
+            if streaming_reuse_unverified:
+              prefix_cache_entry["full_vlm_reason"] = "disabled_for_unverified_streaming_current_prompt_freshness"
+            elif not exact_window_full_hit:
+              prefix_cache_entry["full_vlm_reason"] = "disabled_without_exact_window_hit"
+            elif not generation_window_signature_match:
+              prefix_cache_entry["full_vlm_reason"] = "disabled_without_exact_generation_window_signature"
+            else:
+              prefix_cache_entry["full_vlm_reason"] = "disabled_without_exact_prompt_cache_context"
+            if runtime_profile is not None:
+              runtime_profile["vlm_full_generation_cache_disabled_for_streaming"] = 1 if streaming_reuse_unverified else 0
+              runtime_profile["vlm_full_generation_cache_disabled_without_exact_window_hit"] = 0 if exact_window_full_hit else 1
+              runtime_profile["vlm_full_generation_cache_disabled_without_exact_window_signature"] = (
+                0 if generation_window_signature_match else 1
+              )
+              runtime_profile["vlm_full_generation_cache_disabled_without_exact_prompt_cache_context"] = (
+                0 if prompt_cache_context_exact else 1
+              )
+              runtime_profile["vlm_full_generation_cache_trusted_replay_disabled_for_diffusion_freshness"] = (
+                1 if trusted_replay_requested or bool(prefix_cache_entry.get("streaming_vlm_trusted_replay_allowed")) else 0
+              )
         if full_generation_usable and isinstance(prefix_cache_entry, dict):
           cached_sequences = prefix_cache_entry["full_vlm_generated_sequences"].to(input_ids.device)
           cached_prompt_cache = prefix_cache_entry["full_vlm_prompt_cache"]
@@ -3968,13 +5254,23 @@ class LocalAlpamayoAdapter:
           isinstance(draft_shifted_kv_plan, dict)
           and draft_shifted_kv_plan.get("valid")
         )
+        draft_shifted_kv_retained_ratio = (
+          float(draft_shifted_kv_plan.get("validated_retained_ratio", draft_shifted_kv_plan.get("retained_ratio", 0.0)) or 0.0)
+          if isinstance(draft_shifted_kv_plan, dict)
+          else 0.0
+        )
+        draft_shifted_source_cache_verify_allowed = bool(
+          draft_shifted_kv_plan_valid
+          and bool(adapter.config.streaming_vlm_trust_shifted_draft)
+          and draft_shifted_kv_retained_ratio >= max(0.0, min(1.0, float(adapter.config.streaming_vlm_prefix_reuse_min_overlap)))
+        )
         if (
           runtime_profile is not None
           and isinstance(prefix_cache_entry, dict)
           and prefix_cache_entry.get("streaming_vlm_draft_generated_sequences") is not None
           and not draft_source_cache_context_match
         ):
-          if not bool(adapter.config.streaming_vlm_source_cache_draft_verify_unverified):
+          if not bool(adapter.config.streaming_vlm_source_cache_draft_verify_unverified) and not draft_shifted_source_cache_verify_allowed:
             runtime_profile["streaming_vlm_draft_verify_source_cache_skipped"] = "disabled_unverified_opt_in"
           elif not draft_shifted_kv_plan_valid:
             invalid_reason = (
@@ -4026,19 +5322,37 @@ class LocalAlpamayoAdapter:
               runtime_profile["streaming_vlm_draft_shifted_kv_plan_range_count"] = int(source_kv_plan.get("range_count", 0) or 0)
               runtime_profile["streaming_vlm_draft_shifted_kv_plan_retained_tokens"] = int(source_kv_plan.get("retained_language_tokens", 0) or 0)
               runtime_profile["streaming_vlm_draft_shifted_kv_plan_retained_ratio"] = float(source_kv_plan.get("retained_ratio", 0.0) or 0.0)
+              runtime_profile["streaming_vlm_draft_shifted_kv_plan_validated_retained_ratio"] = float(
+                source_kv_plan.get("validated_retained_ratio", source_kv_plan.get("retained_ratio", 0.0)) or 0.0
+              )
               runtime_profile["streaming_vlm_draft_shifted_kv_plan_invalid_reason"] = str(source_kv_plan.get("invalid_reason", ""))
               runtime_profile["shifted_prompt_kv_plan_valid"] = 1 if source_kv_plan_valid else 0
               runtime_profile["shifted_prompt_kv_plan_range_count"] = int(source_kv_plan.get("range_count", 0) or 0)
               runtime_profile["shifted_prompt_kv_plan_retained_tokens"] = int(source_kv_plan.get("retained_language_tokens", 0) or 0)
               runtime_profile["shifted_prompt_kv_plan_retained_ratio"] = float(source_kv_plan.get("retained_ratio", 0.0) or 0.0)
               runtime_profile["shifted_prompt_kv_plan_invalid_reason"] = str(source_kv_plan.get("invalid_reason", ""))
-            if (
-              (
-                source_cache_context_match
-                or (
-                  source_kv_plan_valid
-                )
+            shifted_source_cache_candidate = bool(
+              not source_cache_context_match
+              and source_kv_plan_valid
+              and (
+                bool(adapter.config.streaming_vlm_source_cache_draft_verify_unverified)
+                or draft_shifted_source_cache_verify_allowed
               )
+            )
+            source_cache_allowed = bool(source_cache_context_match or shifted_source_cache_candidate)
+            if runtime_profile is not None:
+              runtime_profile["streaming_vlm_draft_verify_source_cache_allowed"] = 1 if source_cache_allowed else 0
+              runtime_profile["streaming_vlm_draft_verify_shifted_source_cache_allowed_by_overlap"] = (
+                1 if draft_shifted_source_cache_verify_allowed and not source_cache_context_match else 0
+              )
+              runtime_profile["streaming_vlm_draft_verify_source_cache_unverified_allowed"] = (
+                1 if shifted_source_cache_candidate else 0
+              )
+              runtime_profile["streaming_vlm_draft_verify_shifted_source_cache_blocked_for_prompt_cache_freshness"] = (
+                0
+              )
+            if (
+              source_cache_allowed
               and
               source_cache is not None
               and source_logits is not None
@@ -4127,6 +5441,11 @@ class LocalAlpamayoAdapter:
                     if source_cache_context_match
                     else "dflash_shifted_source_prompt_cache_suffix_unverified"
                   )
+                  prefix_cache_entry["full_vlm_window_signature"] = prefix_cache_entry.get(
+                    "current_window_signature",
+                    prefix_cache_entry.get("window_signature"),
+                  )
+                  prefix_cache_entry["full_vlm_prompt_cache_context_exact"] = bool(source_cache_context_match)
                   prefix_cache_entry["full_vlm_max_generation_length"] = int(max_generation_length)
                   prefix_cache_entry["full_vlm_eos_token_id"] = int(eos_token_id)
                   prefix_cache_entry["full_vlm_input_seq_len"] = int(input_ids.shape[1])
@@ -4160,9 +5479,10 @@ class LocalAlpamayoAdapter:
                     runtime_profile["vlm_full_generation_cache_store"] = 1
                     runtime_profile["dflash_streaming_draft_full_generation_cache_store"] = 1
                   return generated_sequences, prompt_cache
-                prefix_cache_entry["streaming_vlm_draft_reason"] = (
-                  f"source_cache_verify_rejected_at:{source_accepted_tokens}/{draft_new_tokens}"
-                )
+                if source_accepted_tokens != draft_new_tokens:
+                  prefix_cache_entry["streaming_vlm_draft_reason"] = (
+                    f"source_cache_verify_rejected_at:{source_accepted_tokens}/{draft_new_tokens}"
+                  )
               except Exception as exc:
                 prefix_cache_entry["streaming_vlm_draft_reason"] = f"source_cache_verify_error:{type(exc).__name__}"
                 if runtime_profile is not None:
@@ -4170,6 +5490,12 @@ class LocalAlpamayoAdapter:
             elif runtime_profile is not None and source_cache is not None and source_logits is not None:
               if not source_cache_context_match and not source_kv_plan_valid:
                 runtime_profile["streaming_vlm_draft_verify_source_cache_skipped"] = "invalid_shifted_prompt_kv_plan"
+              elif (
+                not source_cache_context_match
+                and not bool(adapter.config.streaming_vlm_source_cache_draft_verify_unverified)
+                and not draft_shifted_source_cache_verify_allowed
+              ):
+                runtime_profile["streaming_vlm_draft_verify_source_cache_skipped"] = "disabled_unverified_opt_in"
               else:
                 runtime_profile["streaming_vlm_draft_verify_source_cache_skipped"] = "missing_source_cache_requirements"
 
@@ -4298,9 +5624,16 @@ class LocalAlpamayoAdapter:
               prompt_cache = verify_outputs.past_key_values
               generated_sequences = verify_inputs
               prefix_cache_entry["streaming_vlm_draft_reason"] = "verify_accepted"
+              prefix_cache_entry["streaming_vlm_reuse_unverified"] = False
+              prefix_cache_entry["streaming_vlm_reuse_mode"] = "draft_verify"
               prefix_cache_entry["full_vlm_generated_sequences"] = generated_sequences.detach().clone()
               prefix_cache_entry["full_vlm_prompt_cache"] = copy.deepcopy(prompt_cache)
               prefix_cache_entry["full_vlm_prompt_cache_owner"] = "dflash_streaming_draft_verified_current_prompt_cache"
+              prefix_cache_entry["full_vlm_window_signature"] = prefix_cache_entry.get(
+                "current_window_signature",
+                prefix_cache_entry.get("window_signature"),
+              )
+              prefix_cache_entry["full_vlm_prompt_cache_context_exact"] = True
               prefix_cache_entry["full_vlm_max_generation_length"] = int(max_generation_length)
               prefix_cache_entry["full_vlm_eos_token_id"] = int(eos_token_id)
               prefix_cache_entry["full_vlm_input_seq_len"] = int(input_ids.shape[1])
@@ -4358,6 +5691,11 @@ class LocalAlpamayoAdapter:
             prefix_cache_entry["full_vlm_generated_sequences"] = result.generated_sequences.detach().clone()
             prefix_cache_entry["full_vlm_prompt_cache"] = copy.deepcopy(result.prompt_cache)
             prefix_cache_entry["full_vlm_prompt_cache_owner"] = "dflash_generated_prompt_cache"
+            prefix_cache_entry["full_vlm_window_signature"] = prefix_cache_entry.get(
+              "current_window_signature",
+              prefix_cache_entry.get("window_signature"),
+            )
+            prefix_cache_entry["full_vlm_prompt_cache_context_exact"] = True
             prefix_cache_entry["full_vlm_max_generation_length"] = int(max_generation_length)
             prefix_cache_entry["full_vlm_eos_token_id"] = int(eos_token_id)
             prefix_cache_entry["full_vlm_input_seq_len"] = int(input_ids.shape[1])
@@ -4499,6 +5837,7 @@ class LocalAlpamayoAdapter:
     if self.config.processor_model:
       helper.BASE_PROCESSOR_NAME = self.config.processor_model
     self._processor = helper.get_processor(model.tokenizer)
+    self._configure_processor_pixel_budget(self._processor)
     self._target_model_identity["targetModelResolved"] = str(self.config.target_model.resolve())
     self._target_model_identity["processorSource"] = str(getattr(helper, "BASE_PROCESSOR_NAME", ""))
     self._target_model_identity["dflashDraftModel"] = str(self.config.dflash_draft_model)
@@ -4511,6 +5850,57 @@ class LocalAlpamayoAdapter:
     self._helper = helper
     self._torch = torch
     self._loaded = True
+
+  def _configure_processor_pixel_budget(self, processor: Any) -> None:
+    image_processor = getattr(processor, "image_processor", None)
+    if image_processor is None:
+      return
+    min_pixels = max(1, int(self.config.min_pixels))
+    max_pixels = max(min_pixels, int(self.config.max_pixels))
+    for name, value in (("min_pixels", min_pixels), ("max_pixels", max_pixels)):
+      try:
+        setattr(image_processor, name, value)
+      except Exception:
+        pass
+    try:
+      image_processor.size = {
+        "shortest_edge": min_pixels,
+        "longest_edge": max_pixels,
+      }
+    except Exception:
+      pass
+    tokenizer = getattr(processor, "tokenizer", None)
+    if tokenizer is not None:
+      init_kwargs = getattr(tokenizer, "init_kwargs", None)
+      if isinstance(init_kwargs, dict):
+        init_kwargs["min_pixels"] = min_pixels
+        init_kwargs["max_pixels"] = max_pixels
+      for name, value in (("min_pixels", min_pixels), ("max_pixels", max_pixels)):
+        try:
+          setattr(tokenizer, name, value)
+        except Exception:
+          pass
+
+  def _processor_pixel_config_debug(self) -> dict[str, Any]:
+    image_processor = getattr(self._processor, "image_processor", None)
+    if image_processor is None:
+      return {}
+    size = getattr(image_processor, "size", None)
+    if isinstance(size, dict):
+      debug_size = {str(key): int(value) if isinstance(value, (int, float)) else value for key, value in size.items()}
+    else:
+      debug_size = str(size)
+    tokenizer = getattr(self._processor, "tokenizer", None)
+    tokenizer_init_kwargs = getattr(tokenizer, "init_kwargs", None) if tokenizer is not None else None
+    return {
+      "min_pixels": getattr(image_processor, "min_pixels", None),
+      "max_pixels": getattr(image_processor, "max_pixels", None),
+      "size": debug_size,
+      "patch_size": getattr(image_processor, "patch_size", None),
+      "merge_size": getattr(image_processor, "merge_size", None),
+      "tokenizer_min_pixels": tokenizer_init_kwargs.get("min_pixels") if isinstance(tokenizer_init_kwargs, dict) else None,
+      "tokenizer_max_pixels": tokenizer_init_kwargs.get("max_pixels") if isinstance(tokenizer_init_kwargs, dict) else None,
+    }
 
   def _resize_frame_tensor_for_pixel_budget(self, frame_tensor: Any, torch_mod: Any) -> Any:
     max_pixels = int(self.config.max_pixels)
@@ -4771,6 +6161,10 @@ class LocalAlpamayoAdapter:
     try:
       tokenized_data["input_ids"] = self._model.fuse_traj_tokens(tokenized_data["input_ids"], traj_data_vlm)
       tokenized_data["_skip_traj_fusion"] = True
+      tokenized_data["_openpilot_fused_input_ids_signature"] = _tensor_crc32_signature(
+        self._torch,
+        tokenized_data.get("input_ids"),
+      )
     except Exception:
       tokenized_data["_skip_traj_fusion"] = False
 
@@ -4830,12 +6224,30 @@ class LocalAlpamayoAdapter:
       cache_stats=cache_stats,
     )
     prefix_stats = cache_stats.get("vlmPrefixCache", {})
+    prefix_entry = getattr(self._model, "_openpilot_vlm_prefix_cache_entry", None)
+    exact_window_full_hit = int(cache_stats.get("window_full_hit", 0) or 0) == 1 or bool(prefix_stats.get("exactHit"))
+    if isinstance(prefix_entry, dict):
+      prefix_entry["current_window_full_hit"] = exact_window_full_hit
+      prefix_entry["current_window_signature"] = window_signature
+      prefix_entry["window_full_hit"] = exact_window_full_hit
+    trusted_visual_replay_requested = bool(
+      isinstance(prefix_entry, dict)
+      and prefix_entry.get("streaming_vlm_trusted_replay_allowed")
+    )
+    trusted_visual_replay_allowed = bool(
+      trusted_visual_replay_requested
+      and self.config.disable_reasoning_generation
+      and self.config.no_reasoning_trust_shifted_prompt_cache
+      and not self._require_state_fresh_no_reasoning()
+    )
+    if trusted_visual_replay_requested and not trusted_visual_replay_allowed:
+      cache_stats["streaming_visual_feature_precompute_trusted_replay_disabled_for_diffusion_freshness"] = 1
     skip_visual_for_full_generation_replay = bool(
       isinstance(prefix_stats, dict)
       and int(prefix_stats.get("hit", 0) or 0) == 1
       and bool(prefix_stats.get("fullGenerationReady"))
+      and (exact_window_full_hit or trusted_visual_replay_allowed)
     )
-    prefix_entry = getattr(self._model, "_openpilot_vlm_prefix_cache_entry", None)
     source_cache_shifted_kv_plan = (
       prefix_entry.get("streaming_vlm_draft_shifted_prompt_kv_reuse_plan")
       if isinstance(prefix_entry, dict)
@@ -4845,24 +6257,82 @@ class LocalAlpamayoAdapter:
       isinstance(source_cache_shifted_kv_plan, dict)
       and source_cache_shifted_kv_plan.get("valid")
     )
+    source_cache_shifted_kv_retained_ratio = (
+      float(source_cache_shifted_kv_plan.get("validated_retained_ratio", source_cache_shifted_kv_plan.get("retained_ratio", 0.0)) or 0.0)
+      if isinstance(source_cache_shifted_kv_plan, dict)
+      else 0.0
+    )
+    source_cache_shifted_verify_allowed_by_overlap = bool(
+      source_cache_shifted_kv_plan_valid
+      and bool(self.config.streaming_vlm_trust_shifted_draft)
+      and source_cache_shifted_kv_retained_ratio >= max(0.0, min(1.0, float(self.config.streaming_vlm_prefix_reuse_min_overlap)))
+    )
+    source_cache_draft_verify_allowed = bool(
+      isinstance(prefix_entry, dict)
+      and (
+        bool(prefix_entry.get("streaming_vlm_draft_source_cache_context_match"))
+        or (
+          source_cache_shifted_kv_plan_valid
+          and (
+            bool(self.config.streaming_vlm_source_cache_draft_verify_unverified)
+            or source_cache_shifted_verify_allowed_by_overlap
+          )
+        )
+      )
+    )
     skip_visual_for_source_cache_draft_verify = bool(
       isinstance(prefix_stats, dict)
       and int(prefix_stats.get("hit", 0) or 0) == 1
       and str(prefix_stats.get("streamingReuseMode", "")) == "draft_verify"
       and isinstance(prefix_entry, dict)
-      and (
-        bool(prefix_entry.get("streaming_vlm_draft_source_cache_context_match"))
-        or source_cache_shifted_kv_plan_valid
-      )
+      and source_cache_draft_verify_allowed
       and prefix_entry.get("streaming_vlm_draft_dflash_target_cache") is not None
       and prefix_entry.get("streaming_vlm_draft_dflash_prefill_logits") is not None
+    )
+    try:
+      shifted_kv_visual_fill_precompute = bool(int(os.environ.get("ALPAMAYO_SHIFTED_KV_VISUAL_FILL_PRECOMPUTE", "0")))
+    except Exception:
+      shifted_kv_visual_fill_precompute = False
+    skip_visual_for_shifted_kv_current_suffix = bool(
+      isinstance(prefix_stats, dict)
+      and int(prefix_stats.get("hit", 0) or 0) == 1
+      and self.config.disable_reasoning_generation
+      and self._require_state_fresh_no_reasoning()
+      and isinstance(prefix_entry, dict)
+      and prefix_entry.get("streaming_vlm_shift_source_prompt_cache") is not None
+      and source_cache_shifted_verify_allowed_by_overlap
+      and not shifted_kv_visual_fill_precompute
     )
     if skip_visual_for_full_generation_replay:
       cache_stats["streaming_visual_feature_precompute_skipped_full_generation_replay"] = 1
     if skip_visual_for_source_cache_draft_verify:
       cache_stats["streaming_visual_feature_precompute_skipped_source_cache_draft_verify_unverified"] = 1
+    if skip_visual_for_shifted_kv_current_suffix:
+      cache_stats["streaming_visual_feature_precompute_skipped_shifted_kv_current_suffix"] = 1
+    if isinstance(prefix_entry, dict):
+      streaming_reuse_mode = str(prefix_entry.get("streaming_vlm_reuse_mode", ""))
+      streaming_reuse_unverified = bool(prefix_entry.get("streaming_vlm_reuse_unverified")) or streaming_reuse_mode.endswith("_unverified")
+      if (
+        (
+          skip_visual_for_full_generation_replay
+          and not exact_window_full_hit
+          and not trusted_visual_replay_allowed
+        )
+        or (streaming_reuse_unverified and not trusted_visual_replay_allowed)
+      ):
+        if skip_visual_for_full_generation_replay:
+          cache_stats["streaming_visual_feature_precompute_full_generation_replay_disabled_for_freshness"] = 1
+        if skip_visual_for_source_cache_draft_verify and streaming_reuse_unverified:
+          cache_stats["streaming_visual_feature_precompute_source_cache_skip_disabled_for_freshness"] = 1
+        skip_visual_for_full_generation_replay = False
+        if streaming_reuse_unverified:
+          skip_visual_for_source_cache_draft_verify = False
 
-    skip_visual_precompute = skip_visual_for_full_generation_replay or skip_visual_for_source_cache_draft_verify
+    skip_visual_precompute = (
+      skip_visual_for_full_generation_replay
+      or skip_visual_for_source_cache_draft_verify
+      or skip_visual_for_shifted_kv_current_suffix
+    )
 
     if self.config.streaming_vision_cache and not skip_visual_precompute:
       streaming_token_blocks = cache_stats.get("streamingVisionCache", {}).get("token_blocks")
@@ -4996,11 +6466,19 @@ class LocalAlpamayoAdapter:
       raise RuntimeError("runtimeConfig.reasoningMode missing")
     if _is_truthy_skip_flag(runtime_config.get("skipVlmGeneration")):
       raise RuntimeError("runtimeConfig.skipVlmGeneration is forbidden for production Alpamayo")
-    if str(reasoning_mode) != REQUIRED_REASONING_MODE:
+    requested_reasoning_mode = str(reasoning_mode)
+    if self.config.disable_reasoning_generation:
+      if requested_reasoning_mode not in (REQUIRED_REASONING_MODE, "disabled", "none", "no_reasoning"):
+        raise RuntimeError(
+          "runtimeConfig.reasoningMode must be 'full', 'disabled', 'none', or 'no_reasoning' "
+          "when ALPAMAYO_DISABLE_REASONING_GENERATION=1"
+        )
+      return "disabled"
+    if requested_reasoning_mode != REQUIRED_REASONING_MODE:
       raise RuntimeError(
         f"runtimeConfig.reasoningMode must be '{REQUIRED_REASONING_MODE}' in production local Alpamayo"
       )
-    return str(reasoning_mode)
+    return requested_reasoning_mode
 
   def _cache_position_seed_for_length(self, length: int) -> Any:
     assert self._torch is not None and self._model is not None
@@ -5069,9 +6547,14 @@ class LocalAlpamayoAdapter:
     generated_sequence_length = extra.get("generated_sequence_length")
     if not isinstance(generated_sequence_length, (int, float, np.integer, np.floating)):
       raise RuntimeError("model extra output missing generated_sequence_length")
-    if int(generated_sequence_length) <= prompt_tokens:
+    generated_tokens = int(generated_sequence_length) - int(prompt_tokens)
+    if self.config.disable_reasoning_generation:
+      if int(generated_sequence_length) < prompt_tokens:
+        raise RuntimeError("model generated sequence shorter than prompt in no-reasoning Alpamayo mode")
+      return max(0, generated_tokens)
+    if generated_tokens <= 0:
       raise RuntimeError("skipping VLM reasoning output is forbidden for production local Alpamayo")
-    return int(generated_sequence_length) - prompt_tokens
+    return generated_tokens
 
   def _build_infer_graph_signature(
     self,
@@ -5479,37 +6962,55 @@ class LocalAlpamayoAdapter:
     self,
     cache_stats: dict[str, Any],
     runtime_profile: dict[str, Any],
+    force_vlm_refresh: bool | None = None,
   ) -> dict[str, Any]:
     base_steps = max(1, int(self.config.diffusion_steps))
     kwargs: dict[str, Any] = {"inference_step": base_steps}
     overlap_ratio = self._warm_overlap_ratio(cache_stats)
+    force_vlm_refresh = bool(getattr(self, "_openpilot_force_vlm_refresh", False) if force_vlm_refresh is None else force_vlm_refresh)
     runtime_profile["adaptive_flow_enabled"] = 1 if self.config.adaptive_flow_enabled else 0
     runtime_profile["adaptive_flow_base_steps"] = base_steps
     runtime_profile["adaptive_flow_selected_steps"] = base_steps
     runtime_profile["adaptive_flow_schedule"] = self.config.adaptive_flow_schedule
     runtime_profile["adaptive_flow_overlap_ratio"] = overlap_ratio
+    runtime_profile["adaptive_flow_force_refresh_full_diffusion"] = 1 if force_vlm_refresh else 0
     if not self.config.adaptive_flow_enabled:
       runtime_profile["adaptive_flow_mode"] = "disabled"
       return kwargs
 
     min_steps = max(1, min(base_steps, int(self.config.adaptive_flow_min_steps)))
-    selected_steps = min_steps if overlap_ratio >= float(self.config.adaptive_flow_overlap_threshold) else base_steps
+    selected_steps = base_steps if force_vlm_refresh else (min_steps if overlap_ratio >= float(self.config.adaptive_flow_overlap_threshold) else base_steps)
     graphable_one_step = selected_steps <= 1 and selected_steps < base_steps
-    reuse_middle_velocity = bool(self.config.adaptive_flow_reuse_middle_velocity and not graphable_one_step)
-    reuse_initial_noise = bool(self.config.adaptive_flow_reuse_initial_noise and not graphable_one_step)
-    action_cache_reuse = bool(self.config.adaptive_flow_action_cache_reuse and not graphable_one_step)
+    reuse_middle_velocity = bool(self.config.adaptive_flow_reuse_middle_velocity and not force_vlm_refresh)
+    reuse_initial_noise = bool(self.config.adaptive_flow_reuse_initial_noise and not force_vlm_refresh)
+    action_cache_reuse = bool(self.config.adaptive_flow_action_cache_reuse and not graphable_one_step and not force_vlm_refresh)
+    prefix_stats = cache_stats.get("vlmPrefixCache", {}) if isinstance(cache_stats, dict) else {}
+    streaming_mode = str(prefix_stats.get("streamingReuseMode", "")) if isinstance(prefix_stats, dict) else ""
+    streaming_shifted_noise_key = bool(
+      isinstance(prefix_stats, dict)
+      and (
+        bool(prefix_stats.get("streamingReuseHit", False))
+        or streaming_mode in ("trusted_full_replay_no_reasoning", "shifted_kv_current_state_suffix")
+      )
+    )
+    if streaming_shifted_noise_key:
+      reuse_middle_velocity = False
+      action_cache_reuse = False
     kwargs["inference_step"] = selected_steps
     kwargs["adaptive_flow_schedule"] = self.config.adaptive_flow_schedule
     kwargs["adaptive_flow_reuse_middle_velocity"] = reuse_middle_velocity
     kwargs["adaptive_flow_reuse_initial_noise"] = reuse_initial_noise
     kwargs["adaptive_flow_action_cache_reuse"] = action_cache_reuse
     kwargs["adaptive_flow_overlap_ratio"] = overlap_ratio
+    kwargs["adaptive_flow_streaming_shifted_noise_key"] = streaming_shifted_noise_key
     runtime_profile["adaptive_flow_selected_steps"] = selected_steps
     runtime_profile["adaptive_flow_min_steps"] = min_steps
     runtime_profile["adaptive_flow_overlap_threshold"] = float(self.config.adaptive_flow_overlap_threshold)
     runtime_profile["adaptive_flow_reuse_middle_velocity"] = 1 if reuse_middle_velocity else 0
     runtime_profile["adaptive_flow_reuse_initial_noise"] = 1 if reuse_initial_noise else 0
     runtime_profile["adaptive_flow_action_cache_reuse"] = 1 if action_cache_reuse else 0
+    runtime_profile["adaptive_flow_streaming_shifted_noise_key"] = 1 if streaming_shifted_noise_key else 0
+    runtime_profile["adaptive_flow_streaming_reuse_mode"] = streaming_mode
     runtime_profile["adaptive_flow_graphable_one_step"] = 1 if graphable_one_step else 0
     runtime_profile["adaptive_flow_mode"] = (
       "overlap_reduced_steps_graphable"
@@ -5536,14 +7037,35 @@ class LocalAlpamayoAdapter:
       for block in token_blocks
       if isinstance(block, dict)
     )
+    inference_step = int(diffusion_kwargs.get("inference_step", self.config.diffusion_steps))
+    overlap_ratio = float(diffusion_kwargs.get("adaptive_flow_overlap_ratio", 0.0) or 0.0)
+    if bool(diffusion_kwargs.get("adaptive_flow_streaming_shifted_noise_key", False)):
+      return (
+        "adaptive_flow_v1_streaming_shifted_noise",
+        str(self.config.target_model),
+        tuple(self.config.camera_streams),
+        int(self.config.num_frames),
+        str(diffusion_kwargs.get("adaptive_flow_schedule", "uniform")),
+        inference_step,
+      )
+    if inference_step <= 1 and overlap_ratio >= float(self.config.adaptive_flow_overlap_threshold):
+      return (
+        "adaptive_flow_v1_warm_one_step_coarse",
+        str(self.config.target_model),
+        tuple(self.config.camera_streams),
+        int(self.config.num_frames),
+        str(diffusion_kwargs.get("adaptive_flow_schedule", "uniform")),
+        inference_step,
+        round(overlap_ratio, 2),
+      )
     return (
       "adaptive_flow_v1",
       str(self.config.target_model),
       tuple(self.config.camera_streams),
       int(self.config.num_frames),
       str(diffusion_kwargs.get("adaptive_flow_schedule", "uniform")),
-      int(diffusion_kwargs.get("inference_step", self.config.diffusion_steps)),
-      round(float(diffusion_kwargs.get("adaptive_flow_overlap_ratio", 0.0) or 0.0), 6),
+      inference_step,
+      round(overlap_ratio, 6),
       block_signature,
     )
 
@@ -5565,6 +7087,7 @@ class LocalAlpamayoAdapter:
     diffusion_kwargs["adaptive_flow_cache_key"] = cache_key
     runtime_profile["adaptive_flow_cache_enabled"] = 1
     runtime_profile["adaptive_flow_cache_key_size"] = len(cache_key)
+    runtime_profile["adaptive_flow_cache_key_mode"] = str(cache_key[0]) if cache_key else ""
     if self._model is not None:
       self._model._openpilot_adaptive_flow_cache = self._adaptive_flow_cache
     with self._cache_lock:
@@ -5768,17 +7291,48 @@ class LocalAlpamayoAdapter:
       or self.config.graph_action_stage
     )
 
+  def _require_state_fresh_no_reasoning(self) -> bool:
+    return bool(
+      self.config.require_state_fresh_no_reasoning
+      and not bool(getattr(self, "_openpilot_defer_state_fresh_no_reasoning", False))
+    )
+
   def infer(self, request: dict[str, Any]) -> dict[str, Any]:
     start = time.perf_counter()
     if self.config.skip_vlm_generation:
       raise RuntimeError("skip_vlm_generation is forbidden in local production Alpamayo mode")
     requested_reasoning_mode = self._assert_reasoning_mode(request)
+    reasoning_generation_disabled = bool(self.config.disable_reasoning_generation)
+    effective_skip_vlm_generation = bool(self.config.skip_vlm_generation)
+    effective_max_generation_length = 0 if reasoning_generation_disabled else int(self.config.max_generation_length)
+    runtime_config = request.get("runtimeConfig", {})
+    force_vlm_refresh = bool(
+      isinstance(runtime_config, dict)
+      and str(runtime_config.get("alpamayoForceVlmRefresh", runtime_config.get("forceVlmRefresh", ""))).strip().lower()
+      in ("1", "true", "yes", "on")
+    )
+    defer_state_fresh_no_reasoning = bool(
+      isinstance(runtime_config, dict)
+      and str(runtime_config.get("alpamayoDeferStateFreshNoReasoning", "")).strip().lower()
+      in ("1", "true", "yes", "on")
+    )
+    require_fast_no_prefill = bool(
+      isinstance(runtime_config, dict)
+      and str(runtime_config.get("alpamayoRequireFastNoPrefill", "")).strip().lower()
+      in ("1", "true", "yes", "on")
+    )
+    setattr(self, "_openpilot_defer_state_fresh_no_reasoning", defer_state_fresh_no_reasoning)
 
     self._ensure_loaded()
     self._ensure_dflash_loaded()
     assert self._torch is not None and self._model is not None
     torch = self._torch
     runtime_profile: dict[str, float | int] = {}
+    runtime_profile["reasoning_generation_disabled"] = 1 if reasoning_generation_disabled else 0
+    runtime_profile["vlm_autoregressive_generation_skipped"] = 1 if reasoning_generation_disabled else 0
+    runtime_profile["effective_max_generation_length"] = int(effective_max_generation_length)
+    runtime_profile["defer_state_fresh_no_reasoning"] = 1 if defer_state_fresh_no_reasoning else 0
+    runtime_profile["require_fast_no_prefill"] = 1 if require_fast_no_prefill else 0
     paro_runtime_stats = self._collect_paro_runtime_stats()
     if not self.config.paro_native:
       if self.config.paro_require_cuda_modules:
@@ -5802,7 +7356,29 @@ class LocalAlpamayoAdapter:
     if self.config.paro_activation_int8 and self.config.paro_native:
       if not bool(paro_runtime_stats.get("allActivationInt8", False)):
         raise RuntimeError("ALPAMAYO_PARO_ACTIVATION_INT8 is set but not all native Paro modules are activation-INT8-ready")
-    model_inputs, cache_stats = self._build_model_inputs(request)
+    setattr(self, "_openpilot_force_vlm_refresh", force_vlm_refresh)
+    try:
+      model_inputs, cache_stats = self._build_model_inputs(request)
+    finally:
+      setattr(self, "_openpilot_force_vlm_refresh", False)
+    if require_fast_no_prefill:
+      prefix_stats = cache_stats.get("vlmPrefixCache", {}) if isinstance(cache_stats, dict) else {}
+      prefix_hit = bool(isinstance(prefix_stats, dict) and int(prefix_stats.get("hit", 0) or 0) == 1)
+      streaming_mode = str(prefix_stats.get("streamingReuseMode", "")) if isinstance(prefix_stats, dict) else ""
+      full_generation_ready = bool(isinstance(prefix_stats, dict) and prefix_stats.get("fullGenerationReady"))
+      no_prefill_ready = bool(
+        prefix_hit
+        and (
+          full_generation_ready
+          or streaming_mode in ("trusted_full_replay_no_reasoning", "shifted_kv_current_state_suffix")
+        )
+      )
+      runtime_profile["fast_no_prefill_prefix_hit"] = 1 if prefix_hit else 0
+      runtime_profile["fast_no_prefill_full_generation_ready"] = 1 if full_generation_ready else 0
+      runtime_profile["fast_no_prefill_ready"] = 1 if no_prefill_ready else 0
+      if not no_prefill_ready:
+        reason = str(prefix_stats.get("reason", "missing_prefix_cache")) if isinstance(prefix_stats, dict) else "missing_prefix_cache"
+        raise RuntimeError(f"alpamayo_fast_no_prefill_required: {reason}")
     visual_input_shape = self._assert_visual_inputs(model_inputs["tokenized_data"], torch)
     prompt_token_count = int(model_inputs["tokenized_data"]["input_ids"].shape[1])
     static_graph_eligible = self._check_static_graph_eligibility(model_inputs["tokenized_data"], runtime_profile)
@@ -5812,7 +7388,7 @@ class LocalAlpamayoAdapter:
         "CUDA graph static shape guard failed: "
         f"{runtime_profile.get('static_graph_shape_reject_reasons', 'unknown')}"
       )
-    diffusion_kwargs = self._build_diffusion_kwargs(cache_stats, runtime_profile)
+    diffusion_kwargs = self._build_diffusion_kwargs(cache_stats, runtime_profile, force_vlm_refresh=force_vlm_refresh)
     self._record_adaptive_flow_cache_candidate(cache_stats, diffusion_kwargs, runtime_profile)
 
     autocast_dtype = _torch_dtype(torch, self.config.autocast_dtype)
@@ -5833,12 +7409,12 @@ class LocalAlpamayoAdapter:
         top_p=generation_top_p,
         temperature=generation_temperature,
         num_traj_samples=1,
-        max_generation_length=self.config.max_generation_length,
+        max_generation_length=effective_max_generation_length,
         diffusion_kwargs=diffusion_kwargs,
         runtime_profile=runtime_profile,
         do_sample=do_sample,
         manual_generation=runtime_manual_generation,
-        skip_vlm_generation=self.config.skip_vlm_generation,
+        skip_vlm_generation=effective_skip_vlm_generation,
         return_extra=False,
       )
       if (
@@ -5852,12 +7428,12 @@ class LocalAlpamayoAdapter:
         top_p=generation_top_p,
         temperature=generation_temperature,
         num_traj_samples=1,
-        max_generation_length=self.config.max_generation_length,
+        max_generation_length=effective_max_generation_length,
         diffusion_kwargs=diffusion_kwargs,
         runtime_profile=runtime_profile,
         do_sample=do_sample,
         manual_generation=runtime_manual_generation,
-        skip_vlm_generation=self.config.skip_vlm_generation,
+        skip_vlm_generation=effective_skip_vlm_generation,
         return_extra=False,
         )
       elif outputs is None and self.config.cuda_graphs and dflash_runtime_enabled and not self.config.dflash_graph_capture:
@@ -5882,12 +7458,12 @@ class LocalAlpamayoAdapter:
           top_p=generation_top_p,
           temperature=generation_temperature,
           num_traj_samples=1,
-          max_generation_length=self.config.max_generation_length,
+          max_generation_length=effective_max_generation_length,
           diffusion_kwargs=diffusion_kwargs,
           runtime_profile=runtime_profile,
           do_sample=do_sample,
           manual_generation=runtime_manual_generation,
-          skip_vlm_generation=self.config.skip_vlm_generation,
+          skip_vlm_generation=effective_skip_vlm_generation,
           return_extra=True,
         )
     if (
@@ -5924,6 +7500,7 @@ class LocalAlpamayoAdapter:
       "streamingVlmPrefixReuse": self.config.streaming_vlm_prefix_reuse,
       "streamingVlmTrustShiftedDraft": self.config.streaming_vlm_trust_shifted_draft,
       "streamingVlmSourceCacheDraftVerifyUnverified": self.config.streaming_vlm_source_cache_draft_verify_unverified,
+      "streamingVlmTrustedReplayRefreshInterval": self.config.streaming_vlm_trusted_replay_refresh_interval,
       "targetModel": str(self.config.target_model),
       "targetModelIdentity": self._target_model_identity,
       "requireFlashVlaTarget": self.config.require_flashvla_target,
@@ -5931,6 +7508,7 @@ class LocalAlpamayoAdapter:
       "numFrames": self.config.num_frames,
       "minPixels": self.config.min_pixels,
       "maxPixels": self.config.max_pixels,
+      "processorPixelConfig": self._processor_pixel_config_debug(),
       "diffusionSteps": self.config.diffusion_steps,
       "adaptiveFlowEnabled": self.config.adaptive_flow_enabled,
       "adaptiveFlowSchedule": self.config.adaptive_flow_schedule,
@@ -5969,15 +7547,21 @@ class LocalAlpamayoAdapter:
       "autocastDtype": self.config.autocast_dtype,
       "manualGeneration": runtime_manual_generation,
       "skipVlmGeneration": self.config.skip_vlm_generation,
+      "reasoningGenerationDisabled": reasoning_generation_disabled,
+      "vlmAutoregressiveGenerationSkipped": reasoning_generation_disabled,
+      "configuredMaxGenerationLength": self.config.max_generation_length,
+      "effectiveMaxGenerationLength": effective_max_generation_length,
+      "forceVlmRefresh": force_vlm_refresh,
+      "deferStateFreshNoReasoning": defer_state_fresh_no_reasoning,
       "reasoningGeneratedTokens": reasoning_new_tokens,
       "deepstackInputShapes": visual_input_shape,
     }
     prefix_entry = getattr(self._model, "_openpilot_vlm_prefix_cache_entry", None)
     prefix_debug = cache_stats.get("vlmPrefixCache")
     if isinstance(prefix_entry, dict) and isinstance(prefix_debug, dict):
+      prefix_input_seq_len = int(prefix_entry.get("input_seq_len", prefix_entry.get("full_vlm_input_seq_len", 0)) or 0)
       prefix_debug.update({
-        "fullGenerationReady": prefix_entry.get("full_vlm_generated_sequences") is not None
-        and prefix_entry.get("full_vlm_prompt_cache") is not None,
+        "fullGenerationReady": self._vlm_prefix_entry_full_generation_ready(prefix_entry, prefix_input_seq_len),
         "fullGenerationReason": str(prefix_entry.get("full_vlm_reason", "")),
         "fullGenerationHits": int(prefix_entry.get("full_vlm_hits", 0) or 0),
         "fullGenerationStores": int(prefix_entry.get("full_vlm_stores", 0) or 0),
@@ -5985,6 +7569,14 @@ class LocalAlpamayoAdapter:
         "streamingReuseMode": str(prefix_entry.get("streaming_vlm_reuse_mode", "")),
         "streamingReuseUnverified": bool(prefix_entry.get("streaming_vlm_reuse_unverified")),
         "streamingReuseChainDepth": int(prefix_entry.get("streaming_vlm_reuse_chain_depth", 0) or 0),
+        "trustedReplayAllowed": bool(prefix_entry.get("streaming_vlm_trusted_replay_allowed")),
+        "trustedReplayRequested": bool(prefix_entry.get("streaming_vlm_trusted_replay_requested")),
+        "stateFreshNoReasoningRequired": bool(prefix_entry.get("streaming_vlm_state_fresh_no_reasoning_required")),
+        "stateFreshNoReasoningForcedPrefill": bool(prefix_entry.get("full_vlm_state_fresh_no_reasoning_forced_prefill")),
+        "trustedReplayDisabledForDiffusionFreshness": bool(
+          prefix_entry.get("streaming_vlm_trusted_replay_disabled_for_diffusion_freshness")
+        ),
+        "refreshDue": bool(prefix_entry.get("streaming_vlm_refresh_due")),
         "languageVisualTokenSpans": len(prefix_entry.get("language_visual_token_spans", []) or []),
         "shiftedPromptKvReusePlan": prefix_entry.get("streaming_vlm_draft_shifted_prompt_kv_reuse_plan", {}),
       })

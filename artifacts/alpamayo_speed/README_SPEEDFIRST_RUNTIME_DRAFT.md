@@ -1,4 +1,4 @@
-﻿# DRAFT: speed-first Alpamayo warm-frame runtime
+# DRAFT: speed-first Alpamayo warm-frame runtime
 
 Last updated: 2026-05-31 10:35 ET.
 
@@ -42,7 +42,7 @@ Current control diagnosis:
 ```text
 Direct trajectory mode is not a valid driving interface for MetaDrive.
 It feeds Alpamayo trajectory velocity/acceleration into low-level MetaDrive gas, which caused speed runaway and out-of-road termination.
-planner_bridge treats Alpamayo semanticPlan.trajectory as planner/path intent only, extracts bounded lateral intent at preview distance, and lets the old MetaDrive route follower own actuator stabilization and speed discipline.
+planner_bridge treats Alpamayo semanticPlan.trajectory as planner/path intent, samples the age-adjusted future trajectory, and lets the MetaDrive route follower act as the actuator layer. The bridge no longer clips Alpamayo lateral output to 0.8 m or to the current lane half-width; full-lane-change authority is available when Alpamayo emits that lateral trajectory.
 ```
 
 Current reasoning status:
@@ -116,7 +116,7 @@ Python venv:
 Run from `E:\ture_opamayo` in PowerShell:
 
 ```powershell
-wsl.exe -e bash -lc 'source /mnt/g/alpamayo1.5/a1_5_venv/bin/activate && cd /mnt/e/ture_opamayo/openpilot_alpamayo && export PYTHONPATH=/mnt/e/ture_opamayo/openpilot_alpamayo:/mnt/g/alpamayo1.5:/mnt/g/alpamayo1.5/src && export ALPAMAYO_ROOT=/mnt/g/alpamayo1.5 && export ALPAMAYO_TARGET_MODEL=/mnt/e/ture_opamayo/openpilot_alpamayo/Alpamayo-1.5-10B-finetuned && export FLASHVLA_TARGET_MODEL=/mnt/e/ture_opamayo/openpilot_alpamayo/Alpamayo-1.5-10B-finetuned && export ALPAMAYO_DFLASH_ENABLED=1 && export ALPAMAYO_DFLASH_DRAFT_MODEL=/mnt/e/ture_opamayo/openpilot_alpamayo/Alpamayo-1.5-DFlash && export ALPAMAYO_DFLASH_PACKAGE_ROOT=/mnt/e/ture_opamayo/openpilot_alpamayo/dflash && export ALPAMAYO_STREAMING_VISION_ATTENTION_MASK=1 && export ALPAMAYO_STREAMING_VLM_TRUST_SHIFTED_DRAFT=0 && export ALPAMAYO_STREAMING_VLM_SOURCE_CACHE_DRAFT_VERIFY_UNVERIFIED=0 && export ALPAMAYO_CUDA_GRAPHS=0 && export ALPAMAYO_GRAPH_VISUAL_STAGE=0 && export ALPAMAYO_GRAPH_PREFILL_STAGE=0 && export ALPAMAYO_GRAPH_STANDARD_PREFILL_STAGE=0 && export ALPAMAYO_GRAPH_DRAFT_VERIFY_PREFILL_STAGE=0 && export ALPAMAYO_GRAPH_DECODE_STAGE=0 && export ALPAMAYO_GRAPH_ACTION_STAGE=0 && export ALPAMAYO_STATIC_GRAPH_STRICT_SHAPES=0 && export ALPAMAYO_PC_TRACE_PATH=/mnt/e/ture_opamayo/openpilot_alpamayo/openpilot/artifacts/alpamayo_speed/pc_endpoint_plannerbridge_full_reasoning_65kpix.trace.jsonl && python -m openpilot.selfdrive.alpamayo.pc_endpoint'
+wsl.exe -e bash -lc 'source /mnt/g/alpamayo1.5/a1_5_venv/bin/activate && cd /mnt/e/ture_opamayo/openpilot_alpamayo && export PYTHONPATH=/mnt/e/ture_opamayo/openpilot_alpamayo:/mnt/g/alpamayo1.5:/mnt/g/alpamayo1.5/src && export ALPAMAYO_ROOT=/mnt/g/alpamayo1.5 && export ALPAMAYO_TARGET_MODEL=/mnt/e/ture_opamayo/openpilot_alpamayo/Alpamayo-1.5-10B-finetuned && export FLASHVLA_TARGET_MODEL=/mnt/e/ture_opamayo/openpilot_alpamayo/Alpamayo-1.5-10B-finetuned && export ALPAMAYO_DFLASH_ENABLED=1 && export ALPAMAYO_DFLASH_DRAFT_MODEL=/mnt/e/ture_opamayo/openpilot_alpamayo/Alpamayo-1.5-DFlash && export ALPAMAYO_DFLASH_PACKAGE_ROOT=/mnt/e/ture_opamayo/openpilot_alpamayo/dflash && export ALPAMAYO_STREAMING_VISION_ATTENTION_MASK=1 && export ALPAMAYO_STREAMING_VLM_TRUST_SHIFTED_DRAFT=1 && export ALPAMAYO_STREAMING_VLM_TRUSTED_REPLAY_REFRESH_INTERVAL=24 && export ALPAMAYO_STREAMING_VLM_SOURCE_CACHE_DRAFT_VERIFY_UNVERIFIED=0 && export ALPAMAYO_CUDA_GRAPHS=0 && export ALPAMAYO_GRAPH_VISUAL_STAGE=0 && export ALPAMAYO_GRAPH_PREFILL_STAGE=0 && export ALPAMAYO_GRAPH_STANDARD_PREFILL_STAGE=0 && export ALPAMAYO_GRAPH_DRAFT_VERIFY_PREFILL_STAGE=0 && export ALPAMAYO_GRAPH_DECODE_STAGE=0 && export ALPAMAYO_GRAPH_ACTION_STAGE=0 && export ALPAMAYO_STATIC_GRAPH_STRICT_SHAPES=0 && export ALPAMAYO_PC_TRACE_PATH=/mnt/e/ture_opamayo/openpilot_alpamayo/openpilot/artifacts/alpamayo_speed/pc_endpoint_boundedreplay_65kpix.trace.jsonl && python -m openpilot.selfdrive.alpamayo.pc_endpoint'
 ```
 
 Endpoint URL:
@@ -145,7 +145,7 @@ Run after the endpoint is resident:
 ```powershell
 cd E:\ture_opamayo\openpilot
 $out = "artifacts\reasoned_trajectory_poc\metadrive_old_controller_alpamayofast_plannerbridge_fullreason_300_20260531_095823"
-py -3.11 tools\reasoned_trajectory_poc\run_metadrive_overlay_demo.py --engine alpamayofast --novel-scene random_mixed --frames 300 --speed-mps 2.5 --disable-vlm-speed-control --tick-sec 0.05 --deadline-ms 300 --save-every 1 --map 3 --seed 7 --random-scene-seed 42 --camera-width 256 --camera-height 256 --alpamayo-endpoint-url http://127.0.0.1:8765/alpamayo --alpamayo-endpoint-timeout-s 300 --alpamayo-num-frames 4 --alpamayo-query-every 2 --alpamayo-catchup-stride-steps 1 --alpamayo-control-mode planner_bridge --alpamayo-lateral-preview-m 12 --alpamayo-max-lateral-offset-m 0.8 --alpamayo-steer-sign -1 --alpamayo-reasoning-overlay --alpamayo-reasoning-overlay-chars 220 --out $out
+py -3.11 tools\reasoned_trajectory_poc\run_metadrive_overlay_demo.py --engine alpamayofast --novel-scene random_mixed --frames 300 --speed-mps 2.5 --disable-vlm-speed-control --tick-sec 0.05 --deadline-ms 300 --save-every 1 --map 3 --seed 7 --random-scene-seed 42 --camera-width 256 --camera-height 256 --alpamayo-endpoint-url http://127.0.0.1:8765/alpamayo --alpamayo-endpoint-timeout-s 300 --alpamayo-num-frames 4 --alpamayo-query-every 2 --alpamayo-catchup-stride-steps 1 --alpamayo-control-mode planner_bridge --alpamayo-lateral-preview-m 12 --alpamayo-steer-sign -1 --alpamayo-reasoning-overlay --alpamayo-reasoning-overlay-chars 220 --out $out
 py -3.11 tools\reasoned_trajectory_poc\render_demo_videos.py --run-dir $out --prefix old_controller_alpamayofast_plannerbridge_fullreason_300 --fps 20
 ```
 
@@ -170,7 +170,7 @@ E:\ture_opamayo\openpilot\artifacts\reasoned_trajectory_poc\metadrive_old_contro
 Endpoint trace for that run:
 
 ```text
-E:\ture_opamayo\openpilot_alpamayo\openpilot\artifacts\alpamayo_speed\pc_endpoint_plannerbridge_full_reasoning_65kpix.trace.jsonl
+E:\ture_opamayo\openpilot_alpamayo\openpilot\artifacts\alpamayo_speed\pc_endpoint_boundedreplay_65kpix.trace.jsonl
 ```
 
 ## Current prompt being fed
@@ -347,3 +347,89 @@ Push note:
 Use SSH remote plus GIT_LFS_SKIP_PUSH=1 and --no-verify for this branch.
 Plain push can hang because .lfsconfig points Git LFS pre-push at comma.ai's GitLab LFS endpoint.
 ```
+
+
+## Draft update: bounded shifted replay mode
+
+Latest speed-first validation run:
+
+```text
+run dir: openpilot/artifacts/reasoned_trajectory_poc/metadrive_boundedreplay_trafficlight_noped_300_20260531_1125
+endpoint trace: openpilot_alpamayo/openpilot/artifacts/alpamayo_speed/pc_endpoint_boundedreplay_65kpix.trace.jsonl
+mode: ALPAMAYO_STREAMING_VLM_TRUST_SHIFTED_DRAFT=1
+mode: ALPAMAYO_STREAMING_VLM_TRUSTED_REPLAY_REFRESH_INTERVAL=24
+mode: ALPAMAYO_STREAMING_VLM_SOURCE_CACHE_DRAFT_VERIFY_UNVERIFIED=0
+```
+
+Result:
+
+```text
+300 frames
+valid_endpoint_responses=56
+endpoint_deadline_misses=2
+warm shifted trusted replay rows=54
+warm shifted trusted replay max=117.878122 ms
+warm shifted trusted replay p95=99.7542 ms
+overall endpoint p95 including cold/refresh=133.559600 ms
+overall endpoint p99 including cold/refresh=3497.089600 ms
+```
+
+Interpretation:
+
+```text
+The shifted warm cache-resident replay rows are under 300 ms.
+The bounded refresh path proves reasoning is not indefinitely stuck on the first block, but refresh itself still blocks for 2.5-3.1 s.
+This is speed-first bounded staleness, not a completed real shifted current-prompt KV rebuild.
+```
+
+## DRAFT update: 2026-06-01 openpilot-controller MetaDrive proof run
+
+This is the current valid side-by-side controller proof for the speed-first Alpamayo runtime.
+
+Status:
+- Draft, sim-only.
+- Current valid Alpamayo MetaDrive control source is `alpamayo_openpilot_controller`.
+- The previous route-follower actuator bridge is superseded for controller proof runs.
+- The Alpamayo branch now ingests `semanticPlan` into an openpilot-shaped plan, derives desired curvature/speed, applies openpilot curvature limiting, then adapts curvature/accel to MetaDrive actuators.
+- Production `modeld` semantic fusion now gives valid Alpamayo `semanticPlan` full authority instead of near-horizon blending.
+
+Endpoint command used/equivalent launch command:
+
+```powershell
+wsl.exe -e bash -lc 'source /mnt/g/alpamayo1.5/a1_5_venv/bin/activate && cd /mnt/e/ture_opamayo/openpilot_alpamayo && export PYTHONPATH=/mnt/e/ture_opamayo/openpilot_alpamayo:/mnt/g/alpamayo1.5:/mnt/g/alpamayo1.5/src && export ALPAMAYO_ROOT=/mnt/g/alpamayo1.5 && export ALPAMAYO_TARGET_MODEL=/mnt/e/ture_opamayo/openpilot_alpamayo/Alpamayo-1.5-10B-finetuned && export ALPAMAYO_DFLASH_ENABLED=1 && export ALPAMAYO_DFLASH_DRAFT_MODEL=/mnt/e/ture_opamayo/openpilot_alpamayo/Alpamayo-1.5-DFlash && export ALPAMAYO_DFLASH_PACKAGE_ROOT=/mnt/e/ture_opamayo/openpilot_alpamayo/dflash && export ALPAMAYO_STREAMING_VLM_TRUST_SHIFTED_DRAFT=1 && export ALPAMAYO_STREAMING_VLM_TRUSTED_REPLAY_REFRESH_INTERVAL=24 && export ALPAMAYO_STREAMING_VLM_SOURCE_CACHE_DRAFT_VERIFY_UNVERIFIED=0 && export ALPAMAYO_MIN_PIXELS=65536 && export ALPAMAYO_MAX_PIXELS=65536 && export ALPAMAYO_CUDA_GRAPHS=0 && export ALPAMAYO_STATIC_GRAPH_STRICT_SHAPES=0 && export ALPAMAYO_GRAPH_VISUAL_STAGE=0 && export ALPAMAYO_GRAPH_PREFILL_STAGE=0 && export ALPAMAYO_GRAPH_STANDARD_PREFILL_STAGE=0 && export ALPAMAYO_GRAPH_DRAFT_VERIFY_PREFILL_STAGE=0 && export ALPAMAYO_GRAPH_DECODE_STAGE=0 && export ALPAMAYO_GRAPH_ACTION_STAGE=0 && export ALPAMAYO_PC_TRACE_PATH=/mnt/e/ture_opamayo/openpilot/artifacts/alpamayo_speed/pc_endpoint_openpilot_controller_norm_820_65kpix.trace.jsonl && python -m openpilot.selfdrive.alpamayo.pc_endpoint --host 0.0.0.0 --port 8765'
+```
+
+MetaDrive demo and render command:
+
+```powershell
+cd E:\ture_opamayo\openpilot
+$out = "artifacts\reasoned_trajectory_poc\metadrive_openpilot_controller_norm_randommixed_820_65kpix_20260601"
+py -3.11 tools\reasoned_trajectory_poc\run_metadrive_overlay_demo.py --engine alpamayofast --novel-scene random_mixed --frames 820 --speed-mps 2.5 --tick-sec 0.05 --deadline-ms 100 --save-every 1 --map 3 --seed 7 --random-scene-seed 42 --camera-width 256 --camera-height 256 --alpamayo-endpoint-url http://127.0.0.1:8765/alpamayo --alpamayo-endpoint-timeout-s 300 --alpamayo-num-frames 4 --alpamayo-query-every 2 --alpamayo-catchup-stride-steps 1 --alpamayo-control-mode planner_bridge --alpamayo-lateral-preview-m 12 --alpamayo-max-lateral-offset-m 0.8 --alpamayo-steer-sign -1 --alpamayo-longitudinal-preview-s 1.0 --alpamayo-max-accel-mps2 1.5 --alpamayo-max-decel-mps2 3.0 --alpamayo-reasoning-overlay --alpamayo-reasoning-overlay-chars 220 --out $out
+py -3.11 tools\reasoned_trajectory_poc\render_demo_videos.py --run-dir $out --prefix openpilot_controller_norm_randommixed_820_65kpix --fps 20
+```
+
+Artifacts:
+- Run: `openpilot/artifacts/reasoned_trajectory_poc/metadrive_openpilot_controller_norm_randommixed_820_65kpix_20260601`
+- Video: `openpilot/artifacts/reasoned_trajectory_poc/metadrive_openpilot_controller_norm_randommixed_820_65kpix_20260601/videos/side_by_side_openpilot_controller_norm_randommixed_820_65kpix.mp4`
+- Comparison JSON: `openpilot/artifacts/reasoned_trajectory_poc/metadrive_openpilot_controller_norm_randommixed_820_65kpix_20260601/comparison_alpamayofast.json`
+- Per-frame records: `openpilot/artifacts/reasoned_trajectory_poc/metadrive_openpilot_controller_norm_randommixed_820_65kpix_20260601/vlm/episode_alpamayofast_records.json`
+- Reasoning log: `openpilot/artifacts/reasoned_trajectory_poc/metadrive_openpilot_controller_norm_randommixed_820_65kpix_20260601/vlm/alpamayo_response_reasoning.jsonl`
+
+Audited result:
+- Stock frames: `820`.
+- Alpamayo frames: `820`.
+- Alpamayo active control frames: `788/788` via `control_source=alpamayo_openpilot_controller`.
+- Warmup stock frames inside Alpamayo episode: `32`.
+- Stock route start/final/delta: `5.005555629730225 / 205.52471024383075 / 200.51915461410053 m`.
+- Alpamayo route start/final/delta: `5.005555629730225 / 205.63082634645005 / 200.62527071671983 m`.
+- Alpamayo minus stock route delta: `+0.10611610261929627 m`.
+- Endpoint valid/calls/errors/deadline: `197/197/0/0`.
+- Endpoint p95/p99/max: `36.48899996187538 ms / 40.02240003319457 ms / 42.12589998496696 ms`.
+- Alpamayo terminated/truncated: `false/false`.
+- Failure audit: `0` crash/collision/impact/offroad/barrier/human/pedestrian records.
+- Required openpilot-controller debug keys present on all 788 Alpamayo control frames: `alpamayo_openpilot_controller`, `alpamayo_control_mode_openpilot_controller`, `alpamayo_route_progress_speed_scale`, `alpamayo_actuator_openpilot_desired_curvature`, `alpamayo_actuator_openpilot_requested_curvature`.
+
+Conclusion:
+- This run is the current controller proof artifact.
+- It supersedes the old 300-frame route-follower planner_bridge artifact as the current MetaDrive side-by-side command.
+- It proves Alpamayo reaches the same course end distance as stock within `0.107 m`, without logged ped impact, offroad, or barrier impact, while the Alpamayo-controlled portion uses the openpilot-controller path.

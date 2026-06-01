@@ -1032,6 +1032,57 @@ def dflash_generate_alpamayo(
     and int(prefix_cache_entry.get("dflash_full_input_seq_len", -1)) == int(input_ids.shape[1])
     and tuple(prefix_cache_entry.get("dflash_layer_ids", ())) == cached_layer_ids
   )
+  if full_generation_usable and isinstance(prefix_cache_entry, dict):
+    exact_window_full_hit = bool(
+      prefix_cache_entry.get("current_window_full_hit")
+      or prefix_cache_entry.get("exact_window_full_hit")
+      or prefix_cache_entry.get("window_full_hit")
+    )
+    streaming_reuse_mode = str(prefix_cache_entry.get("streaming_vlm_reuse_mode", ""))
+    streaming_reuse_unverified = bool(prefix_cache_entry.get("streaming_vlm_reuse_unverified")) or streaming_reuse_mode.endswith("_unverified")
+    trusted_replay_requested = bool(prefix_cache_entry.get("streaming_vlm_trusted_replay_requested"))
+    current_window_signature = prefix_cache_entry.get("current_window_signature")
+    stored_window_signature = prefix_cache_entry.get("dflash_full_window_signature")
+    generation_window_signature_match = bool(
+      current_window_signature is not None
+      and stored_window_signature is not None
+      and stored_window_signature == current_window_signature
+    )
+    prompt_cache_context_exact = bool(prefix_cache_entry.get("dflash_full_prompt_cache_context_exact"))
+    if runtime_profile is not None:
+      runtime_profile["dflash_full_generation_cache_window_signature_match"] = (
+        1 if generation_window_signature_match else 0
+      )
+      runtime_profile["dflash_full_generation_prompt_cache_context_exact"] = (
+        1 if prompt_cache_context_exact else 0
+      )
+    if (
+      streaming_reuse_unverified
+      or not exact_window_full_hit
+      or not generation_window_signature_match
+      or not prompt_cache_context_exact
+    ):
+      full_generation_usable = False
+      if streaming_reuse_unverified:
+        prefix_cache_entry["dflash_full_reason"] = "disabled_for_unverified_streaming_current_prompt_freshness"
+      elif not exact_window_full_hit:
+        prefix_cache_entry["dflash_full_reason"] = "disabled_without_exact_window_hit"
+      elif not generation_window_signature_match:
+        prefix_cache_entry["dflash_full_reason"] = "disabled_without_exact_generation_window_signature"
+      else:
+        prefix_cache_entry["dflash_full_reason"] = "disabled_without_exact_prompt_cache_context"
+      if runtime_profile is not None:
+        runtime_profile["dflash_full_generation_cache_disabled_for_streaming"] = 1 if streaming_reuse_unverified else 0
+        runtime_profile["dflash_full_generation_cache_disabled_without_exact_window_hit"] = 0 if exact_window_full_hit else 1
+        runtime_profile["dflash_full_generation_cache_disabled_without_exact_window_signature"] = (
+          0 if generation_window_signature_match else 1
+        )
+        runtime_profile["dflash_full_generation_cache_disabled_without_exact_prompt_cache_context"] = (
+          0 if prompt_cache_context_exact else 1
+        )
+        runtime_profile["dflash_full_generation_cache_trusted_replay_disabled_for_diffusion_freshness"] = (
+          1 if trusted_replay_requested or bool(prefix_cache_entry.get("streaming_vlm_trusted_replay_allowed")) else 0
+        )
   if (
     temperature == 0.0
     and isinstance(prefix_cache_entry, dict)
@@ -1326,6 +1377,11 @@ def dflash_generate_alpamayo(
       prefix_cache_entry["dflash_full_generated_sequences"] = generated_sequences.detach().clone()
       prefix_cache_entry["dflash_full_prompt_cache"] = copy.deepcopy(target_cache)
       prefix_cache_entry["dflash_full_prompt_cache_owner"] = "prefix_cache_full_generation_stored_immutable_copy"
+      prefix_cache_entry["dflash_full_window_signature"] = prefix_cache_entry.get(
+        "current_window_signature",
+        prefix_cache_entry.get("window_signature"),
+      )
+      prefix_cache_entry["dflash_full_prompt_cache_context_exact"] = True
       prefix_cache_entry["dflash_full_acceptance_lengths"] = list(acceptance_lengths)
       prefix_cache_entry["dflash_full_max_generation_length"] = int(max_generation_length)
       prefix_cache_entry["dflash_full_eos_token_id"] = int(eos_token_id)

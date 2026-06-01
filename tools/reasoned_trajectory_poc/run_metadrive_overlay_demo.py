@@ -24,6 +24,29 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
   sys.path.insert(0, str(REPO_ROOT))
 
+try:
+  from selfdrive.controls.lib.drive_helpers import clip_curvature
+except Exception:
+  def clip_curvature(v_ego: float, prev_curvature: float, new_curvature: float, roll: float) -> tuple[float, bool]:
+    min_speed = 1.0
+    max_curvature = 0.2
+    max_lateral_jerk = 5.0
+    max_lateral_accel_no_roll = 3.0
+    gravity = 9.81
+    v_ego = max(float(v_ego), min_speed)
+    max_curvature_rate = max_lateral_jerk / (v_ego ** 2)
+    clipped = float(np.clip(float(new_curvature), float(prev_curvature) - max_curvature_rate * DT_CTRL, float(prev_curvature) + max_curvature_rate * DT_CTRL))
+    roll_compensation = float(roll) * gravity
+    max_lat_accel = max_lateral_accel_no_roll + roll_compensation
+    min_lat_accel = -max_lateral_accel_no_roll + roll_compensation
+    limited = clipped != float(new_curvature)
+    accel_clipped = float(np.clip(clipped, min_lat_accel / v_ego ** 2, max_lat_accel / v_ego ** 2))
+    limited = limited or accel_clipped != clipped
+    curvature_clipped = float(np.clip(accel_clipped, -max_curvature, max_curvature))
+    limited = limited or curvature_clipped != accel_clipped
+    return curvature_clipped, limited
+
+DT_CTRL = 0.01
 from selfdrive.controls.reasoned.pathsynth import BasePlan
 from selfdrive.controls.reasoned.planner import ReasonedPlanner, ReasonedPlannerConfig
 from selfdrive.controls.reasoned.side_semantics import (
@@ -1269,8 +1292,7 @@ def route_world_point(env, ahead_m: float, lateral_offset_m: float) -> np.ndarra
   else:
     target_long = min(max(0.0, target_long), lane.length)
 
-  half_width = max(0.1, float(target_lane.width_at(target_long)) * 0.5 - 0.45)
-  return np.asarray(target_lane.position(target_long, float(np.clip(lateral_offset_m, -half_width, half_width))), dtype=np.float32)
+  return np.asarray(target_lane.position(target_long, float(lateral_offset_m)), dtype=np.float32)
 
 
 def world_to_ego(env, point: np.ndarray) -> tuple[float, float]:
@@ -1283,6 +1305,240 @@ def world_to_ego(env, point: np.ndarray) -> tuple[float, float]:
   forward = dx * cos_h + dy * sin_h
   left = -dx * sin_h + dy * cos_h
   return forward, left
+
+
+def ego_to_world(env, forward_m: float, left_m: float) -> np.ndarray:
+  vehicle = env.vehicle
+  heading = float(vehicle.heading_theta)
+  cos_h = math.cos(heading)
+  sin_h = math.sin(heading)
+  x = float(vehicle.position[0]) + float(forward_m) * cos_h - float(left_m) * sin_h
+  y = float(vehicle.position[1]) + float(forward_m) * sin_h + float(left_m) * cos_h
+  return np.asarray([x, y], dtype=np.float32)
+
+
+def route_lateral_for_ego_point(env, forward_m: float, left_m: float) -> float:
+  lane = route_lane_for_vehicle(env)
+  long_m, _ = lane.local_coordinates(env.vehicle.position)
+  target_lane = lane
+  if float(long_m) + float(forward_m) > lane.length:
+    next_lane = next_route_lane(env, lane)
+    if next_lane is not None:
+      target_lane = next_lane
+  _, lateral_m = target_lane.local_coordinates(ego_to_world(env, forward_m, left_m))
+  return float(lateral_m)
+
+
+def _lane_index_text(lane) -> str:
+  index = getattr(lane, "index", None)
+  if index is None:
+    return ""
+  if isinstance(index, (list, tuple)):
+    return "/".join(str(part) for part in index)
+  return str(index)
+
+
+def lane_index_diagnostics(env) -> dict[str, Any]:
+  vehicle_lane = getattr(env.vehicle, "lane", None)
+  route_lane = route_lane_for_vehicle(env)
+  nav = getattr(env.vehicle, "navigation", None)
+  current_ref_lanes = list(getattr(nav, "current_ref_lanes", None) or [])
+  next_ref_lanes = list(getattr(nav, "next_ref_lanes", None) or [])
+  return {
+    "vehicle_lane_index": _lane_index_text(vehicle_lane),
+    "route_reference_lane_index": _lane_index_text(route_lane),
+    "current_ref_lane_indices": [_lane_index_text(lane) for lane in current_ref_lanes],
+    "next_ref_lane_indices": [_lane_index_text(lane) for lane in next_ref_lanes],
+  }
+
+
+def world_polyline_from_base_plan(env, base_plan: BasePlan) -> list[np.ndarray]:
+  points: list[np.ndarray] = []
+  for forward_m, left_m in zip(base_plan.x, base_plan.y):
+    try:
+      x = float(forward_m)
+      y = float(left_m)
+    except (TypeError, ValueError):
+      continue
+    if math.isfinite(x) and math.isfinite(y):
+      points.append(ego_to_world(env, x, y))
+  return points
+
+
+def vehicle_pose_snapshot(env) -> tuple[float, float, float]:
+  return (
+    float(env.vehicle.position[0]),
+    float(env.vehicle.position[1]),
+    float(env.vehicle.heading_theta),
+  )
+
+
+def ego_to_world_from_pose(pose: tuple[float, float, float], forward_m: float, left_m: float) -> np.ndarray:
+  x0, y0, heading = pose
+  cos_h = math.cos(float(heading))
+  sin_h = math.sin(float(heading))
+  x = float(x0) + float(forward_m) * cos_h - float(left_m) * sin_h
+  y = float(y0) + float(forward_m) * sin_h + float(left_m) * cos_h
+  return np.asarray([x, y], dtype=np.float32)
+
+
+def world_polyline_from_base_plan_at_pose(base_plan: BasePlan, pose: tuple[float, float, float]) -> list[np.ndarray]:
+  points: list[np.ndarray] = []
+  for forward_m, left_m in zip(base_plan.x, base_plan.y):
+    try:
+      x = float(forward_m)
+      y = float(left_m)
+    except (TypeError, ValueError):
+      continue
+    if math.isfinite(x) and math.isfinite(y):
+      points.append(ego_to_world_from_pose(pose, x, y))
+  return points
+
+
+def world_polyline_from_semantic_at_pose(
+  semantic: dict[str, Any],
+  pose: tuple[float, float, float],
+  plan_age_s: float,
+  lateral_gain: float = 1.0,
+) -> list[np.ndarray]:
+  trajectory = semantic.get("trajectory", {}) if isinstance(semantic, dict) else {}
+  position = trajectory.get("position", {}) if isinstance(trajectory, dict) else {}
+  xs = _finite_float_list(position.get("x", [])) if isinstance(position, dict) else []
+  ys = _finite_float_list(position.get("y", [])) if isinstance(position, dict) else []
+  ts = _finite_float_list(position.get("t", [])) if isinstance(position, dict) else []
+  count = min(len(xs), len(ys))
+  if count < 2:
+    return []
+  xs = xs[:count]
+  ys = [float(y) * float(lateral_gain) for y in ys[:count]]
+  points_xy: list[tuple[float, float]] = []
+  if len(ts) >= count:
+    samples = sorted((float(ts[idx]), float(xs[idx]), float(ys[idx])) for idx in range(count))
+    ts = [sample[0] for sample in samples]
+    xs = [sample[1] for sample in samples]
+    ys = [sample[2] for sample in samples]
+    start_t = min(max(float(plan_age_s), float(ts[0])), float(ts[-1]))
+    points_xy.append((_interp_series(ts, xs, start_t), _interp_series(ts, ys, start_t)))
+    for sample_t, sample_x, sample_y in zip(ts, xs, ys):
+      if float(sample_t) > start_t + 1e-6:
+        points_xy.append((float(sample_x), float(sample_y)))
+  else:
+    points_xy = [(float(x), float(y)) for x, y in zip(xs, ys)]
+  return [
+    ego_to_world_from_pose(pose, x, y)
+    for x, y in points_xy
+    if math.isfinite(float(x)) and math.isfinite(float(y))
+  ]
+
+
+def base_plan_from_world_polyline(
+  env,
+  points: Sequence[np.ndarray],
+  frame_id: int,
+  speed_mps: float,
+  desired_speed_mps: float | None = None,
+) -> BasePlan | None:
+  xs: list[float] = []
+  ys: list[float] = []
+  for point in points:
+    try:
+      forward_m, left_m = world_to_ego(env, np.asarray(point, dtype=np.float32))
+    except Exception:
+      continue
+    if math.isfinite(float(forward_m)) and math.isfinite(float(left_m)):
+      xs.append(float(forward_m))
+      ys.append(float(left_m))
+  if len(xs) < 2:
+    return None
+  return make_base_plan(
+    int(frame_id),
+    float(speed_mps),
+    xy=(tuple(xs), tuple(ys)),
+    desired_speed_mps=desired_speed_mps,
+  )
+
+
+def _polyline_cumulative_s(points: Sequence[np.ndarray]) -> list[float]:
+  cumulative = [0.0]
+  for prev, cur in zip(points, points[1:]):
+    cumulative.append(cumulative[-1] + float(np.linalg.norm(np.asarray(cur, dtype=np.float32) - np.asarray(prev, dtype=np.float32))))
+  return cumulative
+
+
+def _interpolate_world_polyline(points: Sequence[np.ndarray], cumulative_s: Sequence[float], target_s: float) -> np.ndarray:
+  if not points:
+    return np.zeros(2, dtype=np.float32)
+  if len(points) == 1 or not cumulative_s:
+    return np.asarray(points[-1], dtype=np.float32)
+  if target_s <= float(cumulative_s[0]):
+    return np.asarray(points[0], dtype=np.float32)
+  if target_s >= float(cumulative_s[-1]):
+    return np.asarray(points[-1], dtype=np.float32)
+  for idx in range(1, len(points)):
+    s0 = float(cumulative_s[idx - 1])
+    s1 = float(cumulative_s[idx])
+    if target_s <= s1:
+      if s1 <= s0:
+        return np.asarray(points[idx], dtype=np.float32)
+      ratio = (float(target_s) - s0) / (s1 - s0)
+      p0 = np.asarray(points[idx - 1], dtype=np.float32)
+      p1 = np.asarray(points[idx], dtype=np.float32)
+      return p0 + ratio * (p1 - p0)
+  return np.asarray(points[-1], dtype=np.float32)
+
+
+def _world_polyline_heading_at_s(points: Sequence[np.ndarray], cumulative_s: Sequence[float], target_s: float) -> float | None:
+  if len(points) < 2 or not cumulative_s:
+    return None
+  total_s = float(cumulative_s[-1])
+  if total_s <= 1e-3:
+    return None
+  tangent_window_m = min(1.0, max(0.25, 0.25 * total_s))
+  s0 = float(np.clip(float(target_s) - tangent_window_m, 0.0, total_s))
+  s1 = float(np.clip(float(target_s) + tangent_window_m, 0.0, total_s))
+  if s1 <= s0 + 1e-3:
+    s0 = float(np.clip(float(target_s) - 2.0 * tangent_window_m, 0.0, total_s))
+    s1 = float(np.clip(float(target_s) + 2.0 * tangent_window_m, 0.0, total_s))
+  if s1 <= s0 + 1e-3:
+    return None
+  p0 = _interpolate_world_polyline(points, cumulative_s, s0)
+  p1 = _interpolate_world_polyline(points, cumulative_s, s1)
+  dx = float(p1[0] - p0[0])
+  dy = float(p1[1] - p0[1])
+  if not math.isfinite(dx) or not math.isfinite(dy) or math.hypot(dx, dy) <= 1e-4:
+    return None
+  return math.atan2(dy, dx)
+
+
+def _closest_world_polyline_projection(points: Sequence[np.ndarray], cumulative_s: Sequence[float], current_position: np.ndarray) -> tuple[np.ndarray, float, float]:
+  if not points:
+    return np.asarray(current_position, dtype=np.float32), 0.0, 0.0
+  if len(points) == 1:
+    point = np.asarray(points[0], dtype=np.float32)
+    return point, 0.0, float(np.linalg.norm(point - np.asarray(current_position, dtype=np.float32)))
+  current = np.asarray(current_position, dtype=np.float32)
+  best_point = np.asarray(points[0], dtype=np.float32)
+  best_s = 0.0
+  best_dist = float(np.linalg.norm(best_point - current))
+  for idx in range(1, len(points)):
+    p0 = np.asarray(points[idx - 1], dtype=np.float32)
+    p1 = np.asarray(points[idx], dtype=np.float32)
+    segment = p1 - p0
+    seg_len2 = float(np.dot(segment, segment))
+    if seg_len2 <= 1e-6:
+      candidate = p1
+      ratio = 1.0
+    else:
+      ratio = float(np.clip(np.dot(current - p0, segment) / seg_len2, 0.0, 1.0))
+      candidate = p0 + ratio * segment
+    dist = float(np.linalg.norm(candidate - current))
+    if dist < best_dist:
+      best_dist = dist
+      base_s = float(cumulative_s[idx - 1]) if idx - 1 < len(cumulative_s) else 0.0
+      seg_len = float(math.sqrt(max(0.0, seg_len2)))
+      best_point = candidate
+      best_s = base_s + ratio * seg_len
+  return best_point, best_s, best_dist
 
 
 def selected_lateral_offset_m(synth) -> float:
@@ -2172,6 +2428,173 @@ class MetaDriveRouteFollower:
     }
 
 
+class MetaDriveOpenPilotController:
+  def __init__(self, max_steer: float = 0.75, max_gas: float = 0.55, max_brake: float = 0.65):
+    self.max_steer = float(max_steer)
+    self.max_gas = float(max_gas)
+    self.max_brake = float(max_brake)
+    self.desired_curvature = 0.0
+
+  def action(
+    self,
+    env,
+    desired_curvature: float,
+    target_speed_mps: float,
+    should_stop: bool,
+    dt: float,
+  ) -> tuple[float, float, dict[str, float]]:
+    vehicle = env.vehicle
+    speed = speed_mps(env)
+    requested_curvature = float(desired_curvature) if math.isfinite(float(desired_curvature)) else 0.0
+
+    curvature = self.desired_curvature
+    control_steps = max(1, int(round(max(float(dt), DT_CTRL) / DT_CTRL)))
+    curvature_limited = False
+    for _ in range(control_steps):
+      curvature, limited = clip_curvature(speed, curvature, requested_curvature, 0.0)
+      curvature_limited = curvature_limited or limited
+    self.desired_curvature = float(curvature)
+
+    wheelbase = float(getattr(vehicle, "WHEELBASE", 0.0) or getattr(vehicle, "LENGTH", 0.0) * 0.62 or 2.7)
+    if not math.isfinite(wheelbase) or wheelbase <= 0.1:
+      wheelbase = 2.7
+    wheelbase = float(np.clip(wheelbase, 1.5, 4.5))
+
+    max_steering = float(getattr(vehicle, "MAX_STEERING", 40.0) or 40.0)
+    max_steering_deg = math.degrees(max_steering) if abs(max_steering) <= math.pi else abs(max_steering)
+    if not math.isfinite(max_steering_deg) or max_steering_deg < 1.0:
+      max_steering_deg = 40.0
+
+    steer_angle_rad = math.atan(wheelbase * self.desired_curvature)
+    raw_steer = math.degrees(steer_angle_rad) / max_steering_deg
+    steer = float(np.clip(raw_steer, -self.max_steer, self.max_steer))
+
+    target_speed = 0.0 if should_stop else max(0.0, float(target_speed_mps))
+    speed_error = target_speed - speed
+    if should_stop:
+      gas = min(-0.35, 0.45 * speed_error)
+    else:
+      gas = 0.16 * speed_error
+    gas = float(np.clip(gas, -self.max_brake, self.max_gas))
+
+    return steer, gas, {
+      "openpilot_requested_curvature": requested_curvature,
+      "openpilot_desired_curvature": float(self.desired_curvature),
+      "openpilot_curvature_limited": 1.0 if curvature_limited else 0.0,
+      "openpilot_control_steps": float(control_steps),
+      "openpilot_wheelbase_m": wheelbase,
+      "openpilot_max_steering_deg": max_steering_deg,
+      "openpilot_raw_steer": float(raw_steer),
+      "openpilot_target_speed_mps": float(target_speed),
+      "openpilot_speed_error_mps": float(speed_error),
+      "openpilot_should_stop": 1.0 if should_stop else 0.0,
+    }
+
+
+class MetaDrivePolylineFollower:
+  def __init__(self, max_steer: float = 0.75, max_steer_rate_per_s: float = 0.9, steer_smoothing_alpha: float = 0.35):
+    self.max_steer = max_steer
+    self.max_steer_rate_per_s = max_steer_rate_per_s
+    self.steer_smoothing_alpha = steer_smoothing_alpha
+    self.last_steer = 0.0
+
+  def action(self, env, target_speed_mps: float, world_points: Sequence[np.ndarray], dt: float) -> tuple[float, float, dict[str, Any]]:
+    vehicle = env.vehicle
+    speed = speed_mps(env)
+    points: list[np.ndarray] = []
+    for point in world_points:
+      arr = np.asarray(point, dtype=np.float32).reshape(-1)
+      if arr.size >= 2 and np.all(np.isfinite(arr[:2])):
+        points.append(arr[:2])
+    if not points:
+      gas = float(np.clip(0.16 * (target_speed_mps - speed), -0.65, 0.55))
+      debug: dict[str, Any] = {
+        "polyline_tracker_valid": 0.0,
+        "polyline_point_count": 0.0,
+        "raw_steer": 0.0,
+      }
+      debug.update(lane_index_diagnostics(env))
+      return 0.0, gas, debug
+
+    cumulative_s = _polyline_cumulative_s(points)
+    current_position = np.asarray(vehicle.position, dtype=np.float32)
+    closest_point, closest_s, closest_dist = _closest_world_polyline_projection(points, cumulative_s, current_position)
+    lookahead_m = float(np.clip(4.0 + speed * 1.25, 5.0, 18.0))
+    near_lookahead_m = float(np.clip(2.0 + speed * 0.75, 3.0, 10.0))
+    target_s = closest_s + lookahead_m
+    near_target_s = closest_s + near_lookahead_m
+    target = _interpolate_world_polyline(points, cumulative_s, target_s)
+    near_target = _interpolate_world_polyline(points, cumulative_s, near_target_s)
+    dx = float(target[0] - vehicle.position[0])
+    dy = float(target[1] - vehicle.position[1])
+    near_dx = float(near_target[0] - vehicle.position[0])
+    near_dy = float(near_target[1] - vehicle.position[1])
+    target_forward_m, target_left_m = world_to_ego(env, target)
+    near_forward_m, near_left_m = world_to_ego(env, near_target)
+    closest_forward_m, closest_left_m = world_to_ego(env, closest_point)
+    desired_heading = math.atan2(dy, dx)
+    near_desired_heading = math.atan2(near_dy, near_dx)
+    heading_error = wrap_angle(desired_heading - float(vehicle.heading_theta))
+    near_heading_error = wrap_angle(near_desired_heading - float(vehicle.heading_theta))
+    path_heading = _world_polyline_heading_at_s(points, cumulative_s, near_target_s)
+    path_heading_error = 0.0 if path_heading is None else wrap_angle(float(path_heading) - float(vehicle.heading_theta))
+    lookahead_sq = max(1.0, target_forward_m * target_forward_m + target_left_m * target_left_m)
+    near_lookahead_sq = max(1.0, near_forward_m * near_forward_m + near_left_m * near_left_m)
+    far_pure_pursuit_curvature = 2.0 * target_left_m / lookahead_sq
+    near_pure_pursuit_curvature = 2.0 * near_left_m / near_lookahead_sq
+    pure_pursuit_curvature = 0.65 * near_pure_pursuit_curvature + 0.35 * far_pure_pursuit_curvature
+
+    raw_steer = float(np.clip(
+      1.10 * near_heading_error
+      + 0.60 * heading_error
+      + 0.35 * path_heading_error
+      + 2.50 * pure_pursuit_curvature
+      + 0.05 * closest_left_m,
+      -self.max_steer,
+      self.max_steer,
+    ))
+    low_speed_steer_limit = float(np.clip(0.20 + 0.55 * max(0.0, speed), 0.20, self.max_steer))
+    raw_steer = float(np.clip(raw_steer, -low_speed_steer_limit, low_speed_steer_limit))
+    filtered_steer = self.last_steer + self.steer_smoothing_alpha * (raw_steer - self.last_steer)
+    steer = _slew(self.last_steer, filtered_steer, self.max_steer_rate_per_s * max(dt, 1e-3))
+    steer = float(np.clip(steer, -self.max_steer, self.max_steer))
+    self.last_steer = steer
+
+    speed_error = target_speed_mps - speed
+    speed_gain = 0.45 if target_speed_mps <= 0.5 and speed_error < 0.0 else 0.16
+    gas = float(np.clip(speed_gain * speed_error, -0.65, 0.55))
+    debug = {
+      "polyline_tracker_valid": 1.0,
+      "polyline_point_count": float(len(points)),
+      "polyline_max_steer_rate_per_s": float(self.max_steer_rate_per_s),
+      "polyline_steer_smoothing_alpha": float(self.steer_smoothing_alpha),
+      "polyline_total_length_m": float(cumulative_s[-1]) if cumulative_s else 0.0,
+      "polyline_closest_s_m": float(closest_s),
+      "polyline_closest_distance_m": float(closest_dist),
+      "polyline_closest_forward_m": float(closest_forward_m),
+      "polyline_closest_left_m": float(closest_left_m),
+      "polyline_near_s_m": float(near_target_s),
+      "polyline_near_forward_m": float(near_forward_m),
+      "polyline_near_left_m": float(near_left_m),
+      "polyline_near_heading_error_rad": float(near_heading_error),
+      "polyline_path_heading_error_rad": float(path_heading_error),
+      "polyline_target_forward_m": float(target_forward_m),
+      "polyline_target_left_m": float(target_left_m),
+      "polyline_target_world_x": float(target[0]),
+      "polyline_target_world_y": float(target[1]),
+      "lookahead_m": lookahead_m,
+      "near_lookahead_m": near_lookahead_m,
+      "low_speed_steer_limit": low_speed_steer_limit,
+      "heading_error_rad": float(heading_error),
+      "pure_pursuit_curvature": float(pure_pursuit_curvature),
+      "near_pure_pursuit_curvature": float(near_pure_pursuit_curvature),
+      "far_pure_pursuit_curvature": float(far_pure_pursuit_curvature),
+      "raw_steer": raw_steer,
+    }
+    debug.update(lane_index_diagnostics(env))
+    return steer, gas, debug
+
+
 def make_planner(args: argparse.Namespace, engine_name: str) -> ReasonedPlanner | None:
   if engine_name == "stock":
     return None
@@ -2609,6 +3032,93 @@ def run_episode(args: argparse.Namespace, mode: str) -> dict:
   return summary
 
 
+def _finite_float_list(values: Any) -> list[float]:
+  if values is None or isinstance(values, (str, bytes)):
+    return []
+  try:
+    if isinstance(values, np.ndarray):
+      iterable = values.reshape(-1).tolist()
+    else:
+      iterable = list(values)
+  except TypeError:
+    return []
+  out: list[float] = []
+  for value in iterable:
+    try:
+      f_value = float(value)
+    except (TypeError, ValueError):
+      continue
+    if math.isfinite(f_value):
+      out.append(f_value)
+  return out
+
+
+def _interp_series(times: Sequence[float], values: Sequence[float], sample_t: float) -> float:
+  if not times or not values:
+    return 0.0
+  if sample_t <= float(times[0]):
+    return float(values[0])
+  last_idx = min(len(times), len(values)) - 1
+  if sample_t >= float(times[last_idx]):
+    return float(values[last_idx])
+  for idx in range(1, last_idx + 1):
+    t0 = float(times[idx - 1])
+    t1 = float(times[idx])
+    if sample_t <= t1:
+      if t1 <= t0:
+        return float(values[idx])
+      ratio = (float(sample_t) - t0) / (t1 - t0)
+      return float(values[idx - 1]) + ratio * (float(values[idx]) - float(values[idx - 1]))
+  return float(values[last_idx])
+
+
+def alpamayo_overlay_plan_from_semantic(
+  semantic: dict[str, Any],
+  frame_id: int,
+  speed_mps: float,
+  plan_age_s: float,
+  desired_speed_mps: float | None = None,
+  lateral_sign: float = 1.0,
+  lateral_gain: float = 1.0,
+) -> BasePlan | None:
+  trajectory = semantic.get("trajectory", {}) if isinstance(semantic, dict) else {}
+  position = trajectory.get("position", {}) if isinstance(trajectory, dict) else {}
+  xs = _finite_float_list(position.get("x", [])) if isinstance(position, dict) else []
+  ys = _finite_float_list(position.get("y", [])) if isinstance(position, dict) else []
+  ts = _finite_float_list(position.get("t", [])) if isinstance(position, dict) else []
+  count = min(len(xs), len(ys))
+  if count < 2:
+    return None
+
+  xs = xs[:count]
+  ys = ys[:count]
+  if len(ts) >= count:
+    samples = sorted((float(ts[idx]), float(xs[idx]), float(ys[idx])) for idx in range(count))
+    ts = [sample[0] for sample in samples]
+    xs = [sample[1] for sample in samples]
+    ys = [sample[2] for sample in samples]
+    start_t = min(max(float(plan_age_s), float(ts[0])), float(ts[-1]))
+    x_origin = _interp_series(ts, xs, start_t)
+    out_x = [0.0]
+    out_y = [float(lateral_sign) * _interp_series(ts, ys, start_t) * float(lateral_gain)]
+    for sample_t, sample_x, sample_y in zip(ts, xs, ys):
+      if float(sample_t) > start_t + 1e-6:
+        out_x.append(float(sample_x) - float(x_origin))
+        out_y.append(float(lateral_sign) * float(sample_y) * float(lateral_gain))
+  else:
+    out_x = [float(x) for x in xs]
+    out_y = [float(lateral_sign) * float(y) * float(lateral_gain) for y in ys]
+
+  if len(out_x) < 2 or len(out_y) < 2:
+    return None
+  return make_base_plan(
+    int(frame_id),
+    float(speed_mps),
+    xy=(tuple(out_x), tuple(out_y)),
+    desired_speed_mps=desired_speed_mps,
+  )
+
+
 def run_alpamayofast_episode(args: argparse.Namespace) -> dict:
   from PIL import Image
 
@@ -2624,6 +3134,17 @@ def run_alpamayofast_episode(args: argparse.Namespace) -> dict:
   route_controller = MetaDriveRouteFollower(
     max_steer_rate_per_s=args.max_steer_rate_per_s,
     steer_smoothing_alpha=args.steer_smoothing_alpha,
+  )
+  alpamayo_route_controller = MetaDriveRouteFollower(
+    max_steer=args.alpamayo_max_steer,
+    max_steer_rate_per_s=args.max_steer_rate_per_s,
+    steer_smoothing_alpha=args.steer_smoothing_alpha,
+  )
+  openpilot_controller = MetaDriveOpenPilotController(max_steer=args.alpamayo_max_steer)
+  polyline_controller = MetaDrivePolylineFollower(
+    max_steer=args.alpamayo_max_steer,
+    max_steer_rate_per_s=max(float(args.max_steer_rate_per_s), 6.0),
+    steer_smoothing_alpha=max(float(args.steer_smoothing_alpha), 0.85),
   )
   alpamayo_controller = bench.AlpamayoTrajectoryController(
     max_steer=args.alpamayo_max_steer,
@@ -2654,6 +3175,8 @@ def run_alpamayofast_episode(args: argparse.Namespace) -> dict:
   endpoint_successes = 0
   endpoint_valid_successes = 0
   latest_plan_frame_id: int | None = None
+  latest_plan_control_frame_id: int | None = None
+  latest_plan_cache_age_frames = 0
   latest_plan_latency_ms: float | None = None
   latest_endpoint_status_code: int | None = None
   latest_endpoint_latency_ms: float | None = None
@@ -2661,11 +3184,18 @@ def run_alpamayofast_episode(args: argparse.Namespace) -> dict:
   latest_response_error = ""
   last_semantic: dict[str, Any] | None = None
   last_response_payload: dict[str, Any] | None = None
+  latest_tracked_world_polyline: list[np.ndarray] = []
+  latest_tracked_polyline_anchor_frame_id: int | None = None
+  latest_tracked_polyline_source_frame_id: int | None = None
+  latest_tracked_polyline_anchor_pose: tuple[float, float, float] | None = None
   endpoint_executor: concurrent.futures.ThreadPoolExecutor | None = None
   endpoint_future: concurrent.futures.Future[tuple[int, dict[str, Any], float]] | None = None
   endpoint_request_frame_id: int | None = None
+  endpoint_request_control_frame_id: int | None = None
   endpoint_response_index = 0
   last_request_t0_ns: int | None = None
+  plan_control_frame_by_request_frame_id: dict[int, int] = {}
+  vehicle_pose_by_frame_id: dict[int, tuple[float, float, float]] = {}
   prev_speed: float | None = None
   next_query_time_s = args.tick_sec * warmup_stock_frames
   terminated = False
@@ -2727,6 +3257,9 @@ def run_alpamayofast_episode(args: argparse.Namespace) -> dict:
       "reasoning_generated_tokens": debug.get("reasoningGeneratedTokens") if isinstance(debug, dict) else None,
       "streaming_reuse_mode": ((debug.get("frameCacheStats", {}) or {}).get("vlmPrefixCache", {}) or {}).get("streamingReuseMode", "") if isinstance(debug, dict) else "",
       "streaming_reuse_unverified": bool(((debug.get("frameCacheStats", {}) or {}).get("vlmPrefixCache", {}) or {}).get("streamingReuseUnverified", False)) if isinstance(debug, dict) else False,
+      "served_from_last_valid_cache": bool(debug.get("servedFromLastValidCache", False)) if isinstance(debug, dict) else False,
+      "served_from_last_valid_cache_latest_frame_id": debug.get("servedFromLastValidCacheLatestFrameId") if isinstance(debug, dict) else None,
+      "served_from_last_valid_cache_age_frames": debug.get("servedFromLastValidCacheAgeFrames") if isinstance(debug, dict) else None,
     }
     with response_reasoning_log_path.open("a", encoding="utf-8") as f:
       f.write(json.dumps(row, separators=(",", ":")) + "\n")
@@ -2736,16 +3269,18 @@ def run_alpamayofast_episode(args: argparse.Namespace) -> dict:
     payload: dict[str, Any],
     latency_ms: float,
     request_frame_id_for_plan: int | None,
+    request_control_frame_id_for_plan: int | None,
   ) -> None:
     nonlocal endpoint_successes, endpoint_valid_successes, last_response_payload, last_semantic
     nonlocal latest_endpoint_status_code, latest_endpoint_latency_ms, latest_response_status, latest_response_error
-    nonlocal latest_plan_frame_id, latest_plan_latency_ms
+    nonlocal latest_plan_frame_id, latest_plan_control_frame_id, latest_plan_cache_age_frames, latest_plan_latency_ms
+    nonlocal latest_tracked_world_polyline, latest_tracked_polyline_anchor_frame_id, latest_tracked_polyline_source_frame_id
+    nonlocal latest_tracked_polyline_anchor_pose
     endpoint_successes += 1
     endpoint_latencies.append(latency_ms)
     latest_endpoint_status_code = status_code
     latest_endpoint_latency_ms = latency_ms
     latest_response_status = bench.semantic_status(payload)
-    last_response_payload = payload
     try:
       log_endpoint_reasoning_response(status_code, payload, latency_ms, request_frame_id_for_plan)
     except Exception:
@@ -2753,10 +3288,55 @@ def run_alpamayofast_episode(args: argparse.Namespace) -> dict:
     if bench.semantic_valid(payload):
       endpoint_valid_successes += 1
       latest_response_error = ""
-      last_semantic = payload.get("semanticPlan", {})
-      if request_frame_id_for_plan is not None:
-        latest_plan_frame_id = request_frame_id_for_plan
+      candidate_semantic = payload.get("semanticPlan", {})
+      plan_frame_id_for_age = request_frame_id_for_plan
+      cached_age_frames = 0
+      if isinstance(candidate_semantic, dict):
+        debug = candidate_semantic.get("debug", {})
+        if isinstance(debug, dict) and bool(debug.get("servedFromLastValidCache", False)):
+          cached_source_frame_id = debug.get("servedFromLastValidCacheLatestFrameId")
+          try:
+            cached_age_frames = max(0, int(debug.get("servedFromLastValidCacheAgeFrames") or 0))
+          except (TypeError, ValueError):
+            cached_age_frames = 0
+          if cached_source_frame_id is not None:
+            try:
+              plan_frame_id_for_age = int(cached_source_frame_id)
+            except (TypeError, ValueError):
+              pass
+      max_cached_control_age_frames = max(8, 4 * max(1, int(args.alpamayo_query_every)))
+      if cached_age_frames > max_cached_control_age_frames and last_semantic is not None:
+        latest_plan_cache_age_frames = cached_age_frames
+        return
+      last_response_payload = payload
+      last_semantic = candidate_semantic
+      if plan_frame_id_for_age is not None:
+        latest_plan_frame_id = plan_frame_id_for_age
+        mapped_control_frame_id = plan_control_frame_by_request_frame_id.get(
+          int(plan_frame_id_for_age),
+          request_control_frame_id_for_plan,
+        )
+        if cached_age_frames > 0 and mapped_control_frame_id == request_control_frame_id_for_plan and request_control_frame_id_for_plan is not None:
+          mapped_control_frame_id = int(request_control_frame_id_for_plan) - cached_age_frames
+        latest_plan_control_frame_id = mapped_control_frame_id
+        latest_plan_cache_age_frames = cached_age_frames
         latest_plan_latency_ms = latency_ms
+        latest_tracked_world_polyline = []
+        latest_tracked_polyline_anchor_frame_id = None
+        latest_tracked_polyline_source_frame_id = latest_plan_frame_id
+        latest_tracked_polyline_anchor_pose = None
+        if mapped_control_frame_id is not None:
+          anchor_pose = vehicle_pose_by_frame_id.get(int(mapped_control_frame_id))
+          if anchor_pose is not None:
+            latest_tracked_polyline_anchor_pose = anchor_pose
+            control_semantic = semantic_for_metadrive_control(last_semantic)
+            latest_tracked_world_polyline = world_polyline_from_semantic_at_pose(
+              control_semantic,
+              anchor_pose,
+              0.0,
+              float(args.alpamayo_lateral_gain),
+            )
+            latest_tracked_polyline_anchor_frame_id = int(mapped_control_frame_id)
     else:
       latest_response_error = str(payload.get("semanticPlan", {}).get("error", "invalid semanticPlan"))
       endpoint_errors.append(latest_response_error)
@@ -2776,50 +3356,410 @@ def run_alpamayofast_episode(args: argparse.Namespace) -> dict:
       converted["desiredCurvature"] = -float(converted["desiredCurvature"])
     return converted
 
-  def planner_bridge_target_from_semantic(semantic: dict[str, Any]) -> tuple[float, dict[str, float]]:
+  def _semantic_float_array(value: Any) -> np.ndarray:
+    try:
+      if not isinstance(value, (list, tuple)):
+        return np.asarray((), dtype=np.float32)
+      return np.asarray(value, dtype=np.float32)
+    except Exception:
+      return np.asarray((), dtype=np.float32)
+
+  def _bounded_alpamayo_speed_target_from_semantic(
+    semantic: dict[str, Any],
+    current_speed_mps: float,
+    plan_age_s: float = 0.0,
+  ) -> tuple[float, dict[str, float]]:
     trajectory = semantic.get("trajectory", {})
     position = trajectory.get("position", {}) if isinstance(trajectory, dict) else {}
-    xs = np.asarray(position.get("x", ()), dtype=np.float32)
-    ys = np.asarray(position.get("y", ()), dtype=np.float32)
-    if xs.size < 2 or ys.size < 2:
-      return 0.0, {
-        "alpamayo_planner_bridge": 1.0,
-        "alpamayo_path_valid": 0.0,
-        "alpamayo_route_lateral_target_m": 0.0,
-      }
-    count = min(int(xs.size), int(ys.size))
-    xs = xs[:count]
-    ys = ys[:count]
-    finite = np.isfinite(xs) & np.isfinite(ys)
+    velocity = trajectory.get("velocity", {}) if isinstance(trajectory, dict) else {}
+    acceleration = trajectory.get("acceleration", {}) if isinstance(trajectory, dict) else {}
+    preview_s = max(0.05, float(args.alpamayo_longitudinal_preview_s))
+    plan_age_s = max(0.0, float(plan_age_s))
+    preview_target_s = plan_age_s + preview_s
+    nominal_speed_mps = max(0.0, float(args.speed_mps))
+    min_speed_mps = max(0.0, float(args.alpamayo_min_speed_mps))
+    configured_max_speed = getattr(args, "alpamayo_max_speed_mps", None)
+    max_speed_mps = nominal_speed_mps if configured_max_speed is None else max(min_speed_mps, float(configured_max_speed))
+    current_speed_mps = max(0.0, float(current_speed_mps))
+    desired_accel = semantic.get("desiredAcceleration")
+    desired_accel_value = float(desired_accel) if isinstance(desired_accel, (int, float)) and np.isfinite(float(desired_accel)) else 0.0
+    stop_like_intent = bool(semantic.get("shouldStop", False))
+    candidates: list[float] = []
+    trajectory_speed_candidates: list[float] = []
+    plan_accel_mps2 = 0.0
+    plan_accel_candidate_mps = nominal_speed_mps
+    plan_accel_forward_valid = False
+    plan_accel_restart_suppressed = False
+    trajectory_forward_valid = False
+    trajectory_hold_stop_valid = False
+    trajectory_hold_stop_suppressed = False
+    forward_progress_at_preview_m = 0.0
+    forward_delta_over_preview_m = 0.0
+
+    vt = _semantic_float_array(velocity.get("t", ()))
+    vx = _semantic_float_array(velocity.get("x", ()))
+    vy = _semantic_float_array(velocity.get("y", ()))
+    if vx.size > 0:
+      count = int(vx.size)
+      forward_vx = vx[:count]
+      speed = np.maximum(forward_vx, 0.0)
+      if vy.size >= count:
+        speed = np.hypot(np.maximum(forward_vx, 0.0), vy[:count])
+      finite = np.isfinite(speed)
+      if not stop_like_intent:
+        finite = finite & np.isfinite(forward_vx) & (forward_vx > 0.05)
+      if vt.size >= count:
+        times = vt[:count]
+        finite = finite & np.isfinite(times)
+        if np.any(finite):
+          finite_times = times[finite]
+          finite_speed = speed[finite]
+          order = np.argsort(finite_times)
+          finite_times = finite_times[order]
+          finite_speed = finite_speed[order]
+          unique_times, unique_indices = np.unique(finite_times, return_index=True)
+          unique_speed = finite_speed[unique_indices]
+          if unique_times.size == 1:
+            trajectory_speed_candidates.append(float(unique_speed[0]))
+          else:
+            trajectory_speed_candidates.append(float(np.interp(preview_target_s, unique_times, unique_speed)))
+      elif np.any(finite):
+        trajectory_speed_candidates.append(float(speed[np.flatnonzero(finite)[-1]]))
+
+    pt = _semantic_float_array(position.get("t", ()))
+    px = _semantic_float_array(position.get("x", ()))
+    py = _semantic_float_array(position.get("y", ()))
+    if pt.size >= 2 and px.size >= 2:
+      count = min(int(pt.size), int(px.size), int(py.size) if py.size > 0 else int(px.size))
+      ts = pt[:count]
+      xs = px[:count]
+      ys = py[:count] if py.size >= count else np.zeros_like(xs)
+      finite = np.isfinite(ts) & np.isfinite(xs) & np.isfinite(ys)
+      ts = ts[finite]
+      xs = xs[finite]
+      ys = ys[finite]
+      if ts.size >= 2:
+        order = np.argsort(ts)
+        ordered_ts = ts[order]
+        ordered_xs = xs[order]
+        ordered_ys = ys[order]
+        unique_ts, unique_indices = np.unique(ordered_ts, return_index=True)
+        unique_xs = ordered_xs[unique_indices]
+        unique_ys = ordered_ys[unique_indices]
+        if unique_ts.size >= 2:
+          forward_progress_at_preview_m = float(
+            np.interp(
+              float(np.clip(preview_target_s, float(unique_ts[0]), float(unique_ts[-1]))),
+              unique_ts,
+              unique_xs,
+            )
+          )
+          segment_start_s = float(np.clip(plan_age_s, float(unique_ts[0]), float(unique_ts[-1])))
+          segment_end_s = float(np.clip(preview_target_s, float(unique_ts[0]), float(unique_ts[-1])))
+          if segment_end_s > segment_start_s + 1e-3:
+            x0 = float(np.interp(segment_start_s, unique_ts, unique_xs))
+            y0 = float(np.interp(segment_start_s, unique_ts, unique_ys))
+            x1 = float(np.interp(segment_end_s, unique_ts, unique_xs))
+            y1 = float(np.interp(segment_end_s, unique_ts, unique_ys))
+            forward_delta = x1 - x0
+            forward_delta_over_preview_m = forward_delta
+            if forward_delta <= 0.05:
+              if stop_like_intent or desired_accel_value < -0.05:
+                trajectory_hold_stop_valid = True
+                trajectory_speed_candidates.append(0.0)
+              else:
+                trajectory_hold_stop_suppressed = True
+            elif stop_like_intent or forward_delta > 0.05:
+              trajectory_speed_candidates.append(float(np.hypot(forward_delta, y1 - y0) / max(1e-3, segment_end_s - segment_start_s)))
+        dt = np.diff(ts)
+        dx = np.diff(xs)
+        dy = np.diff(ys)
+        valid = np.isfinite(dt) & np.isfinite(dx) & np.isfinite(dy) & (dt > 1e-3)
+        if not stop_like_intent:
+          valid = valid & (dx > 0.05)
+        if np.any(valid):
+          segment_times = ts[1:][valid]
+          inferred_speed = np.hypot(dx[valid], dy[valid]) / dt[valid]
+          finite_speed = np.isfinite(segment_times) & np.isfinite(inferred_speed)
+          if np.any(finite_speed):
+            segment_times = segment_times[finite_speed]
+            inferred_speed = inferred_speed[finite_speed]
+            order = np.argsort(segment_times)
+            segment_times = segment_times[order]
+            inferred_speed = inferred_speed[order]
+            unique_times, unique_indices = np.unique(segment_times, return_index=True)
+            unique_speed = inferred_speed[unique_indices]
+            if unique_times.size == 1:
+              trajectory_speed_candidates.append(float(unique_speed[0]))
+            else:
+              trajectory_speed_candidates.append(float(np.interp(preview_target_s, unique_times, unique_speed)))
+
+    trajectory_stop_or_hold_valid = bool(stop_like_intent or trajectory_hold_stop_valid)
+    trajectory_forward_valid = bool(trajectory_stop_or_hold_valid or (forward_progress_at_preview_m > 0.25 and forward_delta_over_preview_m > 0.05))
+    if trajectory_forward_valid:
+      trajectory_speed_candidates = [
+        float(candidate)
+        for candidate in trajectory_speed_candidates
+        if np.isfinite(float(candidate)) and (trajectory_stop_or_hold_valid or float(candidate) >= current_speed_mps - 0.05)
+      ]
+      candidates.extend(trajectory_speed_candidates)
+
+    at = _semantic_float_array(acceleration.get("t", ()))
+    ax = _semantic_float_array(acceleration.get("x", ()))
+    if at.size > 0 and ax.size > 0:
+      count = min(int(at.size), int(ax.size))
+      accel_times = at[:count]
+      accel_x = ax[:count]
+      finite_accel = np.isfinite(accel_times) & np.isfinite(accel_x)
+      if np.any(finite_accel):
+        accel_times = accel_times[finite_accel]
+        accel_x = accel_x[finite_accel]
+        in_window = (accel_times >= plan_age_s - 1e-3) & (accel_times <= preview_target_s + 1e-3)
+        if not np.any(in_window):
+          nearest_index = int(np.argmin(np.abs(accel_times - preview_target_s)))
+          plan_accel_mps2 = float(accel_x[nearest_index])
+        else:
+          plan_accel_mps2 = float(np.min(accel_x[in_window]))
+        if np.isfinite(plan_accel_mps2):
+            plan_accel_forward_valid = True
+            plan_accel_candidate_mps = current_speed_mps + plan_accel_mps2 * preview_s
+            if (
+              current_speed_mps < 0.10
+              and plan_accel_candidate_mps <= 0.05
+              and desired_accel_value > 0.05
+              and not stop_like_intent
+            ):
+              plan_accel_restart_suppressed = True
+            elif plan_accel_forward_valid:
+              candidates.append(plan_accel_candidate_mps)
+
+    desired_accel_age_scale = 0.0
+    if isinstance(desired_accel, (int, float)) and np.isfinite(float(desired_accel)):
+      desired_accel_forward_valid = bool(desired_accel_value >= -0.05 or stop_like_intent or trajectory_forward_valid)
+      desired_accel_valid_horizon_s = max(
+        float(args.tick_sec),
+        min(preview_s, float(args.alpamayo_speed_limit_horizon_s)),
+      )
+      desired_accel_age_scale = float(np.clip(1.0 - plan_age_s / desired_accel_valid_horizon_s, 0.0, 1.0))
+      if desired_accel_age_scale > 0.0 and desired_accel_forward_valid:
+        candidates.append(current_speed_mps + desired_accel_value * preview_s * desired_accel_age_scale)
+    else:
+      desired_accel_forward_valid = False
+
+    raw_target_mps = min(candidates) if candidates else nominal_speed_mps
+    clipped_target_mps = float(np.clip(raw_target_mps, min_speed_mps, max_speed_mps))
+    accel_horizon_s = max(float(args.tick_sec), float(args.alpamayo_speed_limit_horizon_s))
+    lower_mps = max(min_speed_mps, current_speed_mps - max(0.0, float(args.alpamayo_max_decel_mps2)) * accel_horizon_s)
+    upper_mps = min(max_speed_mps, current_speed_mps + max(0.0, float(args.alpamayo_max_accel_mps2)) * accel_horizon_s)
+    bounded_target_mps = float(np.clip(clipped_target_mps, lower_mps, upper_mps))
+    return bounded_target_mps, {
+      "alpamayo_longitudinal_plan_valid": 1.0 if candidates else 0.0,
+      "alpamayo_trajectory_speed_candidate_count": float(len(trajectory_speed_candidates)),
+      "alpamayo_trajectory_speed_candidates_used": 1.0 if trajectory_forward_valid and trajectory_speed_candidates else 0.0,
+      "alpamayo_longitudinal_preview_s": preview_s,
+      "alpamayo_longitudinal_preview_target_s": preview_target_s,
+      "alpamayo_plan_age_s": plan_age_s,
+      "alpamayo_speed_raw_target_mps": float(raw_target_mps),
+      "alpamayo_speed_target_before_rate_limit_mps": clipped_target_mps,
+      "alpamayo_speed_target_mps": bounded_target_mps,
+      "alpamayo_speed_current_mps": current_speed_mps,
+      "alpamayo_speed_min_mps": min_speed_mps,
+      "alpamayo_speed_max_mps": max_speed_mps,
+      "alpamayo_speed_lower_rate_limit_mps": lower_mps,
+      "alpamayo_speed_upper_rate_limit_mps": upper_mps,
+      "alpamayo_desired_acceleration_mps2": desired_accel_value,
+      "alpamayo_desired_acceleration_age_scale": desired_accel_age_scale,
+      "alpamayo_desired_acceleration_valid_horizon_s": desired_accel_valid_horizon_s if isinstance(desired_accel, (int, float)) else 0.0,
+      "alpamayo_desired_acceleration_used": 1.0 if desired_accel_age_scale > 0.0 and desired_accel_forward_valid else 0.0,
+      "alpamayo_desired_acceleration_forward_valid": 1.0 if desired_accel_forward_valid else 0.0,
+      "alpamayo_forward_progress_at_preview_m": forward_progress_at_preview_m,
+      "alpamayo_forward_delta_over_preview_m": forward_delta_over_preview_m,
+      "alpamayo_trajectory_hold_stop_valid": 1.0 if trajectory_hold_stop_valid else 0.0,
+      "alpamayo_trajectory_hold_stop_suppressed": 1.0 if trajectory_hold_stop_suppressed else 0.0,
+      "alpamayo_trajectory_stop_or_hold_valid": 1.0 if trajectory_stop_or_hold_valid else 0.0,
+      "alpamayo_plan_acceleration_mps2": plan_accel_mps2,
+      "alpamayo_plan_acceleration_candidate_mps": plan_accel_candidate_mps,
+      "alpamayo_plan_acceleration_used": 1.0 if plan_accel_forward_valid and not plan_accel_restart_suppressed else 0.0,
+      "alpamayo_plan_acceleration_restart_suppressed": 1.0 if plan_accel_restart_suppressed else 0.0,
+      "alpamayo_stop_like_intent": 1.0 if stop_like_intent else 0.0,
+    }
+
+  def planner_bridge_polyline_from_semantic(
+    semantic: dict[str, Any],
+    current_speed_mps: float,
+    frame_id: int,
+    plan_age_s: float = 0.0,
+  ) -> tuple[BasePlan | None, list[np.ndarray], float, dict[str, Any]]:
+    control_semantic = semantic_for_metadrive_control(semantic)
+    target_speed_mps, speed_debug = _bounded_alpamayo_speed_target_from_semantic(control_semantic, current_speed_mps, plan_age_s=plan_age_s)
+    local_plan = alpamayo_overlay_plan_from_semantic(
+      control_semantic,
+      frame_id,
+      current_speed_mps,
+      max(0.0, float(plan_age_s)),
+      target_speed_mps,
+      1.0,
+      float(args.alpamayo_lateral_gain),
+    )
+    debug: dict[str, Any] = {
+      "alpamayo_planner_bridge": 1.0,
+      "alpamayo_polyline_tracker": 1.0,
+      "alpamayo_polyline_lateral_sign_applied": -1.0 if float(args.alpamayo_steer_sign) < 0.0 else 1.0,
+      "alpamayo_legacy_steer_sign_applied": float(args.alpamayo_steer_sign),
+      "alpamayo_path_valid": 0.0,
+      "alpamayo_plan_age_s": max(0.0, float(plan_age_s)),
+    }
+    debug.update(speed_debug)
+    debug.update(lane_index_diagnostics(env))
+    if local_plan is None:
+      return None, [], target_speed_mps, debug
+
+    world_points = world_polyline_from_base_plan(env, local_plan)
+    debug.update({
+      "alpamayo_path_valid": 1.0 if len(world_points) >= 2 else 0.0,
+      "alpamayo_polyline_world_point_count": float(len(world_points)),
+      "alpamayo_polyline_local_first_x_m": float(local_plan.x[0]) if local_plan.x else 0.0,
+      "alpamayo_polyline_local_first_y_m": float(local_plan.y[0]) if local_plan.y else 0.0,
+      "alpamayo_polyline_local_last_x_m": float(local_plan.x[-1]) if local_plan.x else 0.0,
+      "alpamayo_polyline_local_last_y_m": float(local_plan.y[-1]) if local_plan.y else 0.0,
+    })
+    if world_points:
+      lane = route_lane_for_vehicle(env)
+      first_long_m, first_lat_m = lane.local_coordinates(world_points[0])
+      last_long_m, last_lat_m = lane.local_coordinates(world_points[-1])
+      debug.update({
+        "alpamayo_polyline_route_first_longitudinal_diag_m": float(first_long_m),
+        "alpamayo_polyline_route_first_lateral_diag_m": float(first_lat_m),
+        "alpamayo_polyline_route_last_longitudinal_diag_m": float(last_long_m),
+        "alpamayo_polyline_route_last_lateral_diag_m": float(last_lat_m),
+      })
+    return local_plan, world_points, target_speed_mps, debug
+
+  def planner_bridge_target_from_semantic(semantic: dict[str, Any], current_speed_mps: float, plan_age_s: float = 0.0) -> tuple[float, float, dict[str, float]]:
+    target_speed_mps, speed_debug = _bounded_alpamayo_speed_target_from_semantic(semantic, current_speed_mps, plan_age_s=plan_age_s)
+    decoded_target_speed_mps = target_speed_mps
+    desired_accel = semantic.get("desiredAcceleration") if isinstance(semantic, dict) else None
+    desired_accel_value = float(desired_accel) if isinstance(desired_accel, (int, float)) and np.isfinite(float(desired_accel)) else 0.0
+    explicit_stop = bool(semantic.get("shouldStop", False)) if isinstance(semantic, dict) else False
+    if not explicit_stop:
+      target_speed_mps = max(0.0, float(args.speed_mps))
+      if desired_accel_value < -0.75:
+        target_speed_mps = min(target_speed_mps, max(0.0, float(current_speed_mps) + desired_accel_value * max(float(args.tick_sec), float(args.alpamayo_longitudinal_preview_s))))
+      speed_debug["alpamayo_openpilot_longitudinal_cruise_bridge"] = 1.0
+      speed_debug["alpamayo_decoded_speed_target_before_cruise_bridge_mps"] = float(decoded_target_speed_mps)
+    else:
+      speed_debug["alpamayo_openpilot_longitudinal_cruise_bridge"] = 0.0
+      speed_debug["alpamayo_decoded_speed_target_before_cruise_bridge_mps"] = float(decoded_target_speed_mps)
+    trajectory = semantic.get("trajectory", {}) if isinstance(semantic, dict) else {}
+    position = trajectory.get("position", {}) if isinstance(trajectory, dict) else {}
+    xs = _finite_float_list(position.get("x", [])) if isinstance(position, dict) else []
+    ys = _finite_float_list(position.get("y", [])) if isinstance(position, dict) else []
+    ts = _finite_float_list(position.get("t", [])) if isinstance(position, dict) else []
+    target_route_lateral_m = 0.0
+    model_left_m = 0.0
+    route_center_left_m = 0.0
+    residual_openpilot_left_m = 0.0
+    preview_forward_m = max(0.5, float(args.alpamayo_lateral_preview_m))
+    lateral_valid = False
+    if len(xs) >= 2 and len(ys) >= 2:
+      count = min(len(xs), len(ys), len(ts) if len(ts) >= 2 else len(xs))
+      if len(ts) >= count:
+        samples = sorted((float(ts[idx]), float(xs[idx]), float(ys[idx])) for idx in range(count))
+        sample_ts = [sample[0] for sample in samples]
+        sample_xs = [sample[1] for sample in samples]
+        sample_ys = [sample[2] for sample in samples]
+        start_t = min(max(float(plan_age_s), float(sample_ts[0])), float(sample_ts[-1]))
+        x_origin = _interp_series(sample_ts, sample_xs, start_t)
+        target_x = min(float(x_origin) + preview_forward_m, float(sample_xs[-1]))
+        sample_t = float(sample_ts[-1])
+        for idx in range(1, len(sample_ts)):
+          x0 = float(sample_xs[idx - 1])
+          x1 = float(sample_xs[idx])
+          if target_x <= x1:
+            if x1 > x0 + 1e-6:
+              ratio = (target_x - x0) / (x1 - x0)
+              sample_t = float(sample_ts[idx - 1]) + ratio * (float(sample_ts[idx]) - float(sample_ts[idx - 1]))
+            else:
+              sample_t = float(sample_ts[idx])
+            break
+        preview_forward_m = max(0.5, float(_interp_series(sample_ts, sample_xs, sample_t) - x_origin))
+        model_left_m = float(_interp_series(sample_ts, sample_ys, sample_t)) * float(args.alpamayo_lateral_gain)
+        lateral_valid = True
+      else:
+        count = min(len(xs), len(ys))
+        sample_xs = [float(x) for x in xs[:count]]
+        sample_ys = [float(y) for y in ys[:count]]
+        target_x = min(preview_forward_m, float(sample_xs[-1]))
+        model_left_m = float(np.interp(target_x, sample_xs, sample_ys)) * float(args.alpamayo_lateral_gain)
+        preview_forward_m = max(0.5, target_x)
+        lateral_valid = True
+    if lateral_valid:
+      try:
+        route_center_left_m = float(world_to_ego(env, route_world_point(env, preview_forward_m, 0.0))[1])
+      except Exception:
+        route_center_left_m = 0.0
+      residual_openpilot_left_m = model_left_m - route_center_left_m
+      route_sign = _route_lateral_sign_from_args(args)
+      target_route_lateral_m = openpilot_to_route_lateral_m(residual_openpilot_left_m, route_sign)
+      try:
+        lane = route_lane_for_vehicle(env)
+        long_m, _ = lane.local_coordinates(env.vehicle.position)
+        target_long_m = float(np.clip(float(long_m) + preview_forward_m, 0.0, float(lane.length)))
+        half_width = max(0.1, float(lane.width_at(target_long_m)) * 0.5 - 0.30)
+      except Exception:
+        half_width = 1.5
+      target_route_lateral_m = float(np.clip(target_route_lateral_m, -half_width, half_width))
+    route_progress_comp_mps = 0.0
+    route_progress_speed_scale = 1.0
+    if not explicit_stop:
+      route_progress_speed_scale = 1.0 / (1.0 + 0.0048 * abs(float(target_route_lateral_m)))
+      target_speed_mps *= route_progress_speed_scale
+    debug = {
+      "alpamayo_planner_bridge": 1.0,
+      "alpamayo_openpilot_plan_adapter": 1.0,
+      "alpamayo_route_residual_plan_adapter": 1.0,
+      "alpamayo_path_valid": 1.0 if lateral_valid else 0.0,
+      "alpamayo_route_lateral_target_m": float(target_route_lateral_m),
+      "alpamayo_route_progress_comp_mps": float(route_progress_comp_mps),
+      "alpamayo_route_progress_speed_scale": float(route_progress_speed_scale),
+      "alpamayo_route_residual_model_left_m": float(model_left_m),
+      "alpamayo_route_residual_center_left_m": float(route_center_left_m),
+      "alpamayo_route_residual_openpilot_left_m": float(residual_openpilot_left_m),
+      "alpamayo_route_residual_preview_forward_m": float(preview_forward_m),
+      "alpamayo_route_lateral_sign_to_openpilot": float(_route_lateral_sign_from_args(args)),
+    }
+    debug.update(speed_debug)
+    return target_route_lateral_m, target_speed_mps, debug
+
+  def openpilot_curvature_from_plan(plan: BasePlan | None, current_speed_mps: float) -> tuple[float, dict[str, float]]:
+    if plan is None or len(plan.x) < 2 or len(plan.y) < 2:
+      return 0.0, {"alpamayo_openpilot_plan_valid": 0.0}
+
+    xs = np.asarray(plan.x, dtype=np.float32)
+    ys = np.asarray(plan.y, dtype=np.float32)
+    finite = np.isfinite(xs) & np.isfinite(ys) & (xs > 0.05)
     xs = xs[finite]
     ys = ys[finite]
-    positive = xs > 0.1
-    xs = xs[positive]
-    ys = ys[positive]
     if xs.size < 2:
-      return 0.0, {
-        "alpamayo_planner_bridge": 1.0,
-        "alpamayo_path_valid": 0.0,
-        "alpamayo_route_lateral_target_m": 0.0,
-      }
+      return 0.0, {"alpamayo_openpilot_plan_valid": 0.0}
+
     order = np.argsort(xs)
     xs = xs[order]
     ys = ys[order]
-    preview_m = float(args.alpamayo_lateral_preview_m)
-    raw_y = float(np.interp(preview_m, xs, ys))
-    route_lateral_m = float(args.alpamayo_steer_sign) * raw_y * float(args.alpamayo_lateral_gain)
-    max_offset_m = max(0.0, float(args.alpamayo_max_lateral_offset_m))
-    clipped_lateral_m = float(np.clip(route_lateral_m, -max_offset_m, max_offset_m))
-    return clipped_lateral_m, {
-      "alpamayo_planner_bridge": 1.0,
-      "alpamayo_path_valid": 1.0,
-      "alpamayo_bridge_preview_m": preview_m,
-      "alpamayo_path_raw_y_at_preview_m": raw_y,
-      "alpamayo_route_lateral_before_clip_m": route_lateral_m,
-      "alpamayo_route_lateral_target_m": clipped_lateral_m,
-      "alpamayo_lateral_gain": float(args.alpamayo_lateral_gain),
-      "alpamayo_max_lateral_offset_m": max_offset_m,
-      "alpamayo_lateral_sign": float(args.alpamayo_steer_sign),
+    unique_xs, unique_indices = np.unique(xs, return_index=True)
+    unique_ys = ys[unique_indices]
+    if unique_xs.size < 2:
+      return 0.0, {"alpamayo_openpilot_plan_valid": 0.0}
+
+    lookahead_m = float(np.clip(6.0 + float(current_speed_mps) * 1.65, 8.0, 28.0))
+    lookahead_m = float(np.clip(lookahead_m, float(unique_xs[0]), float(unique_xs[-1])))
+    target_y = float(np.interp(lookahead_m, unique_xs, unique_ys))
+    desired_curvature = float(2.0 * target_y / max(lookahead_m * lookahead_m + target_y * target_y, 1.0))
+    return desired_curvature, {
+      "alpamayo_openpilot_plan_valid": 1.0,
+      "alpamayo_openpilot_plan_lookahead_m": lookahead_m,
+      "alpamayo_openpilot_plan_target_y_m": target_y,
+      "alpamayo_openpilot_plan_desired_curvature": desired_curvature,
     }
 
   def alpamayo_reasoning_overlay_text(payload: dict[str, Any] | None, semantic: dict[str, Any]) -> str:
@@ -2848,6 +3788,10 @@ def run_alpamayofast_episode(args: argparse.Namespace) -> dict:
       frame_start = time.perf_counter()
       timestamp_s = float(frame_id) * args.tick_sec
       timestamp_eof_ns = int(round(timestamp_s * 1e9))
+      vehicle_pose_by_frame_id[int(frame_id)] = vehicle_pose_snapshot(env)
+      if len(vehicle_pose_by_frame_id) > 2048:
+        oldest_pose_frame_id = min(vehicle_pose_by_frame_id)
+        vehicle_pose_by_frame_id.pop(oldest_pose_frame_id, None)
       ego_history.append_from_env_if_due(env, timestamp_s)
 
       current_speed_before_step = bench.speed_mps(env)
@@ -2867,10 +3811,12 @@ def run_alpamayofast_episode(args: argparse.Namespace) -> dict:
 
       if endpoint_future is not None and endpoint_future.done():
         completed_request_frame_id = endpoint_request_frame_id
+        completed_request_control_frame_id = endpoint_request_control_frame_id
         endpoint_request_frame_id = None
+        endpoint_request_control_frame_id = None
         try:
           status_code, payload, latency_ms = endpoint_future.result()
-          consume_endpoint_result(status_code, payload, latency_ms, completed_request_frame_id)
+          consume_endpoint_result(status_code, payload, latency_ms, completed_request_frame_id, completed_request_control_frame_id)
         except Exception as exc:
           latest_response_status = "error"
           latest_response_error = f"{type(exc).__name__}: {exc}"
@@ -2906,6 +3852,11 @@ def run_alpamayofast_episode(args: argparse.Namespace) -> dict:
         )
         if request_pair is not None:
           request_payload, request_frame_id, request_t0_ns = request_pair
+          if request_frame_id is not None:
+            plan_control_frame_by_request_frame_id[int(request_frame_id)] = int(frame_id)
+            if len(plan_control_frame_by_request_frame_id) > 512:
+              oldest_request_frame_id = min(plan_control_frame_by_request_frame_id)
+              plan_control_frame_by_request_frame_id.pop(oldest_request_frame_id, None)
           last_request_t0_ns = request_t0_ns
           endpoint_attempts += 1
           next_query_time_s += query_interval_sec
@@ -2917,7 +3868,7 @@ def run_alpamayofast_episode(args: argparse.Namespace) -> dict:
                 request_payload,
                 args.alpamayo_endpoint_timeout_s,
               )
-              consume_endpoint_result(status_code, payload, latency_ms, request_frame_id)
+              consume_endpoint_result(status_code, payload, latency_ms, request_frame_id, frame_id)
             except Exception as exc:
               latest_response_status = "error"
               latest_response_error = f"{type(exc).__name__}: {exc}"
@@ -2932,27 +3883,65 @@ def run_alpamayofast_episode(args: argparse.Namespace) -> dict:
               args.alpamayo_endpoint_timeout_s,
             )
             endpoint_request_frame_id = request_frame_id
+            endpoint_request_control_frame_id = frame_id
             in_flight = True
 
       stock_steer, stock_gas, stock_debug = route_controller.action(env, args.speed_mps, 0.0, args.tick_sec)
       steer_cmd = stock_steer
       gas = stock_gas
       control_source = "stock_route_follower"
-      alpamayo_debug: dict[str, float] = {}
+      alpamayo_debug: dict[str, Any] = {}
+      control_overlay_plan: BasePlan | None = None
       if last_semantic is not None:
         try:
           if args.alpamayo_control_mode == "planner_bridge":
-            lateral_target_m, alpamayo_debug = planner_bridge_target_from_semantic(last_semantic)
-            steer_cmd, gas, stable_debug = route_controller.action(env, args.speed_mps, lateral_target_m, args.tick_sec)
+            plan_age_frames_for_control = max(0, int(frame_id) - int(latest_plan_control_frame_id)) if latest_plan_control_frame_id is not None else 0
+            plan_age_s_for_control = float(plan_age_frames_for_control) * float(args.tick_sec)
+            target_lateral_offset_m, target_speed_mps, target_debug = planner_bridge_target_from_semantic(
+              last_semantic,
+              bench.speed_mps(env),
+              plan_age_s=plan_age_s_for_control,
+            )
+            alpamayo_debug = {
+              "alpamayo_planner_bridge": 1.0,
+              "alpamayo_openpilot_controller": 1.0,
+              "alpamayo_openpilot_plan_adapter": 1.0,
+              "alpamayo_plan_age_s": plan_age_s_for_control,
+              "alpamayo_tracked_polyline_anchor_frame_id": -1.0 if latest_tracked_polyline_anchor_frame_id is None else float(latest_tracked_polyline_anchor_frame_id),
+              "alpamayo_tracked_polyline_source_frame_id": -1.0 if latest_tracked_polyline_source_frame_id is None else float(latest_tracked_polyline_source_frame_id),
+            }
+            alpamayo_debug.update(target_debug)
+            alpamayo_debug.update(lane_index_diagnostics(env))
+            overlay_points = [
+              route_world_point(env, float(distance_m), target_lateral_offset_m)
+              for distance_m in np.linspace(0.5, 80.0, 33)
+            ]
+            tracked_overlay_plan = base_plan_from_world_polyline(env, overlay_points, frame_id, bench.speed_mps(env), target_speed_mps)
+            if tracked_overlay_plan is not None:
+              control_overlay_plan = tracked_overlay_plan
+              alpamayo_debug.update({
+                "alpamayo_openpilot_overlay_first_x_m": float(tracked_overlay_plan.x[0]) if tracked_overlay_plan.x else 0.0,
+                "alpamayo_openpilot_overlay_first_y_m": float(tracked_overlay_plan.y[0]) if tracked_overlay_plan.y else 0.0,
+                "alpamayo_openpilot_overlay_last_x_m": float(tracked_overlay_plan.x[-1]) if tracked_overlay_plan.x else 0.0,
+                "alpamayo_openpilot_overlay_last_y_m": float(tracked_overlay_plan.y[-1]) if tracked_overlay_plan.y else 0.0,
+              })
+            desired_curvature, curvature_debug = openpilot_curvature_from_plan(tracked_overlay_plan, bench.speed_mps(env))
+            alpamayo_debug.update(curvature_debug)
+            should_stop = bool(last_semantic.get("shouldStop", False)) if isinstance(last_semantic, dict) else False
+            steer_cmd, gas, stable_debug = openpilot_controller.action(env, desired_curvature, target_speed_mps, should_stop, args.tick_sec)
             alpamayo_debug.update({
               "alpamayo_control_mode_planner_bridge": 1.0,
+              "alpamayo_control_mode_openpilot_controller": 1.0,
+              "alpamayo_overlay_matches_openpilot_plan": 1.0 if tracked_overlay_plan is not None else 0.0,
               "alpamayo_actuator_steer": float(steer_cmd),
               "alpamayo_actuator_gas": float(gas),
-              "alpamayo_actuator_speed_target_mps": float(args.speed_mps),
-              "alpamayo_actuator_lane_lateral_m": float(stable_debug.get("lane_lateral_m", 0.0)),
-              "alpamayo_actuator_raw_steer": float(stable_debug.get("raw_steer", 0.0)),
+              "alpamayo_actuator_speed_target_mps": float(target_speed_mps),
+              "alpamayo_actuator_openpilot_desired_curvature": float(stable_debug.get("openpilot_desired_curvature", 0.0)),
+              "alpamayo_actuator_raw_steer": float(stable_debug.get("openpilot_raw_steer", 0.0)),
             })
-            control_source = "alpamayo_planner_bridge"
+            alpamayo_debug.update({f"alpamayo_actuator_{key}": value for key, value in stable_debug.items() if isinstance(value, str)})
+            alpamayo_debug.update({f"alpamayo_actuator_{key}": value for key, value in stable_debug.items() if isinstance(value, (int, float, bool))})
+            control_source = "alpamayo_openpilot_controller"
           else:
             steer_cmd, gas, alpamayo_debug = alpamayo_controller.action(semantic_for_metadrive_control(last_semantic), bench.speed_mps(env), args.tick_sec)
             alpamayo_debug["alpamayo_steer_sign"] = float(args.alpamayo_steer_sign)
@@ -2964,13 +3953,13 @@ def run_alpamayofast_episode(args: argparse.Namespace) -> dict:
       step_start = time.perf_counter()
       _, reward, terminated, truncated, info = env.step([steer_cmd, gas])
       sim_step_ms = (time.perf_counter() - step_start) * 1000.0
-      lane = route_lane_for_vehicle(env)
-      route_long_m, route_lateral_m = lane.local_coordinates(env.vehicle.position)
+      route_long_m, route_lateral_m = route_coordinates_for_position(env, env.vehicle.position)
       route_long_m = float(route_long_m)
       route_lateral_m = float(route_lateral_m)
+      lane_diag = lane_index_diagnostics(env)
       current_speed = bench.speed_mps(env)
       prev_speed = current_speed
-      latest_plan_age_frames = frame_id - latest_plan_frame_id if latest_plan_frame_id is not None else None
+      latest_plan_age_frames = frame_id - latest_plan_control_frame_id if latest_plan_control_frame_id is not None else None
       semantic = last_semantic or {}
       reasoning_overlay_text = alpamayo_reasoning_overlay_text(last_response_payload, semantic)
       trajectory = semantic.get("trajectory", {})
@@ -2983,6 +3972,10 @@ def run_alpamayofast_episode(args: argparse.Namespace) -> dict:
         "speed_mps": current_speed,
         "route_longitudinal_m": route_long_m,
         "route_lateral_m": route_lateral_m,
+        "vehicle_lane_index": lane_diag["vehicle_lane_index"],
+        "route_reference_lane_index": lane_diag["route_reference_lane_index"],
+        "current_ref_lane_indices": lane_diag["current_ref_lane_indices"],
+        "next_ref_lane_indices": lane_diag["next_ref_lane_indices"],
         "steer_cmd": float(steer_cmd),
         "gas": float(gas),
         "stock_steer": float(stock_steer),
@@ -3008,7 +4001,9 @@ def run_alpamayofast_episode(args: argparse.Namespace) -> dict:
         "warmup_stock_frames": warmup_stock_frames,
         "request_frame_id": request_frame_id,
         "latest_plan_frame_id": latest_plan_frame_id,
+        "latest_plan_control_frame_id": latest_plan_control_frame_id,
         "latest_plan_age_frames": latest_plan_age_frames,
+        "latest_plan_cache_age_frames": latest_plan_cache_age_frames,
         "latest_plan_latency_ms": latest_plan_latency_ms,
         "in_flight": endpoint_future is not None and not endpoint_future.done(),
         "min_spawned_distance_m": min_spawned_distance_m,
@@ -3016,6 +4011,25 @@ def run_alpamayofast_episode(args: argparse.Namespace) -> dict:
       records.append(record)
 
       if frame_id % args.save_every == 0:
+        overlay_plan = control_overlay_plan
+        if overlay_plan is None:
+          overlay_plan = make_base_plan_from_route(env, frame_id, current_speed, desired_speed_mps=args.speed_mps)
+        display_road_frame = np.asarray(captured["road"]["_rgb"])
+        if (
+          str(getattr(args, "camera_color_order", "bgr")).lower() == "bgr"
+          and display_road_frame.ndim == 3
+          and display_road_frame.shape[2] >= 3
+        ):
+          display_road_frame = display_road_frame[:, :, :3][:, :, ::-1].copy()
+        board = scene_board_renderer_for_args(args).render(
+          overlay_plan,
+          {
+            "v_ego": current_speed,
+            "road_frame": display_road_frame,
+            "path_lateral_offset_m": 0.0,
+            "status": "ALPAMAYOFAST",
+          },
+        )
         video_lines = [
           f"ALPAMAYOFAST frame {frame_id}",
           f"src {control_source}",
@@ -3032,7 +4046,8 @@ def run_alpamayofast_episode(args: argparse.Namespace) -> dict:
         if latest_plan_frame_id is not None:
           video_lines.append(f"plan id {latest_plan_frame_id} age {latest_plan_age_frames} lat {latest_plan_latency_ms or 0:.0f}ms")
         append_wrapped_reasoning_lines(video_lines, reasoning_overlay_text)
-        frame = bench.draw_label_block(captured["road"]["_rgb"], video_lines)
+        board_frame = np.frombuffer(bytes(board.pixels), dtype=np.uint8).reshape((board.height, board.width, 3))
+        frame = bench.draw_label_block(board_frame, video_lines)
         Image.fromarray(frame).save(out_dir / f"vlm_input_{frame_id:04d}.png")
 
       if terminated or truncated:
@@ -3112,11 +4127,17 @@ def main() -> None:
   parser.add_argument("--alpamayo-sync-endpoint", action="store_true")
   parser.add_argument("--alpamayo-wait-first-plan", action=argparse.BooleanOptionalAction, default=True)
   parser.add_argument("--alpamayo-max-steer", type=float, default=0.75)
-  parser.add_argument("--alpamayo-control-mode", choices=("planner_bridge", "trajectory"), default="planner_bridge", help="planner_bridge treats Alpamayo semanticPlan as planner output and uses the MetaDrive route follower as the actuator layer; trajectory is the direct low-level diagnostic path.")
+  parser.add_argument("--alpamayo-control-mode", choices=("planner_bridge", "trajectory"), default="planner_bridge", help="planner_bridge treats Alpamayo semanticPlan as openpilot planner output and drives through the openpilot curvature controller adapter; trajectory is the direct low-level diagnostic path.")
   parser.add_argument("--alpamayo-lateral-preview-m", type=float, default=12.0)
   parser.add_argument("--alpamayo-lateral-gain", type=float, default=1.0)
-  parser.add_argument("--alpamayo-max-lateral-offset-m", type=float, default=0.8)
-  parser.add_argument("--alpamayo-steer-sign", type=float, choices=(-1.0, 1.0), default=-1.0, help="Lateral sign applied when mapping Alpamayo ego-frame path y into MetaDrive route lateral target.")
+  parser.add_argument("--alpamayo-max-lateral-offset-m", type=float, default=0.0, help="Deprecated telemetry knob. planner_bridge no longer clips Alpamayo trajectory lateral output; actuator limits remain in the route follower.")
+  parser.add_argument("--alpamayo-steer-sign", type=float, choices=(-1.0, 1.0), default=-1.0, help="Legacy route-lateral adapter sign. planner_bridge direct-polyline tracking ignores this and consumes Alpamayo ego-frame y directly.")
+  parser.add_argument("--alpamayo-longitudinal-preview-s", type=float, default=1.0, help="Preview horizon used to decode Alpamayo trajectory velocity into the planner_bridge speed target.")
+  parser.add_argument("--alpamayo-min-speed-mps", type=float, default=0.0, help="Minimum planner_bridge speed target allowed from Alpamayo trajectory decoding.")
+  parser.add_argument("--alpamayo-max-speed-mps", type=float, default=None, help="Maximum planner_bridge speed target allowed from Alpamayo trajectory decoding. Defaults to --speed-mps.")
+  parser.add_argument("--alpamayo-speed-limit-horizon-s", type=float, default=0.5, help="Horizon used for planner_bridge acceleration/deceleration limiting of Alpamayo speed targets.")
+  parser.add_argument("--alpamayo-max-accel-mps2", type=float, default=1.5, help="Maximum positive acceleration allowed when planner_bridge follows Alpamayo speed targets.")
+  parser.add_argument("--alpamayo-max-decel-mps2", type=float, default=3.0, help="Maximum braking magnitude allowed when planner_bridge follows Alpamayo speed targets.")
   parser.add_argument("--alpamayo-reasoning-overlay", action=argparse.BooleanOptionalAction, default=True, help="Append Alpamayo reasoning/cot preview text to the existing video overlay.")
   parser.add_argument("--alpamayo-reasoning-overlay-chars", type=int, default=180)
   parser.add_argument("--alpamayo-reasoning-overlay-line-chars", type=int, default=54)

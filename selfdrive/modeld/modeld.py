@@ -25,6 +25,7 @@ from openpilot.selfdrive.modeld.fill_model_msg import fill_model_msg, fill_pose_
 from openpilot.common.file_chunker import read_file_chunked, get_manifest_path
 from openpilot.selfdrive.modeld.constants import ModelConstants, Plan
 from openpilot.selfdrive.modeld.helpers import usbgpu_present, modeld_pkl_path, get_tg_input_devices
+from openpilot.selfdrive.modeld.semantic_fusion import apply_semantic_fusion
 
 
 PROCESS_NAME = "selfdrive.modeld.modeld"
@@ -187,7 +188,12 @@ def main(demo=False):
 
   # messaging
   pm = PubMaster(["modelV2", "drivingModelData", "cameraOdometry"])
-  sm = SubMaster(["deviceState", "carState", "roadCameraState", "liveCalibration", "driverMonitoringState", "carControl", "liveDelay"])
+  sm = SubMaster(
+    ["deviceState", "carState", "roadCameraState", "liveCalibration", "driverMonitoringState", "carControl", "liveDelay", "semanticPlan"],
+    ignore_alive=["semanticPlan"],
+    ignore_avg_freq=["semanticPlan"],
+    ignore_valid=["semanticPlan"],
+  )
 
   publish_state = PublishState()
   params = Params()
@@ -301,6 +307,8 @@ def main(demo=False):
       modelv2_send = messaging.new_message('modelV2')
       drivingdata_send = messaging.new_message('drivingModelData')
       posenet_send = messaging.new_message('cameraOdometry')
+      if sm.seen["semanticPlan"]:
+        model_output, _ = apply_semantic_fusion(model_output, sm["semanticPlan"])
 
       frame_delay = DT_MDL # compensate for time passed since the frame was captured: current_time - timestamp_eof is 50ms on average
       action_delay = DT_MDL / 2 # middle of the interval between model output (current state) and next frame (expected state)
